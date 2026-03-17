@@ -1,8 +1,5 @@
-#ifdef CATA_CATCH_PCH
-#undef TWOBLUECUBES_SINGLE_INCLUDE_CATCH_HPP_INCLUDED
-#define CATCH_CONFIG_IMPL_ONLY
-#endif
-#define CATCH_CONFIG_RUNNER
+// Catch2 v3: no CATCH_CONFIG_RUNNER needed; we provide our own main
+// and link against the amalgamated .cpp instead.
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -202,8 +199,8 @@ static option_overrides_t extract_option_overrides( const std::string_view optio
     return ret;
 }
 
-struct CataListener : Catch::TestEventListenerBase {
-    using TestEventListenerBase::TestEventListenerBase;
+struct CataListener : Catch::EventListenerBase {
+    using EventListenerBase::EventListenerBase;
 
     void testRunStarting( Catch::TestRunInfo const & ) override {
         DebugLog( D_INFO, DC_ALL ) << "Running Catch2 session:" << std::endl;
@@ -219,8 +216,10 @@ struct CataListener : Catch::TestEventListenerBase {
 
     void testCaseStarting( Catch::TestCaseInfo const &testInfo ) override {
         if( !game_initialized && !fail_to_init_game_state ) {
-            bool is_nogame = std::find( testInfo.tags.begin(), testInfo.tags.end(),
-                                        "nogame" ) != testInfo.tags.end();
+            bool is_nogame = std::any_of( testInfo.tags.begin(), testInfo.tags.end(),
+            []( const Catch::Tag &t ) {
+                return std::string( t.original ) == "nogame";
+            } );
             if( !is_nogame ) {
                 try {
                     init_global_game_state( mods, option_overrides_for_test_suite, user_dir );
@@ -241,7 +240,7 @@ struct CataListener : Catch::TestEventListenerBase {
     }
 
     void sectionStarting( Catch::SectionInfo const &sectionInfo ) override {
-        TestEventListenerBase::sectionStarting( sectionInfo );
+        EventListenerBase::sectionStarting( sectionInfo );
         // Initialize the cata RNG with the Catch seed for reproducible tests
         const unsigned int seed = m_config->rngSeed();
         if( seed ) {
@@ -255,7 +254,7 @@ struct CataListener : Catch::TestEventListenerBase {
     }
 
     void sectionEnded( Catch::SectionStats const &sectionStats ) override {
-        TestEventListenerBase::sectionEnded( sectionStats );
+        EventListenerBase::sectionEnded( sectionStats );
         if( !sectionStats.assertions.allPassed() ||
             m_config->includeSuccessfulResults() ) {
             std::vector<std::pair<std::string, std::string>> messages =
@@ -275,7 +274,7 @@ struct CataListener : Catch::TestEventListenerBase {
     }
 
     void testCaseEnded( Catch::TestCaseStats const &testCaseStats ) override {
-        TestEventListenerBase::testCaseEnded( testCaseStats );
+        EventListenerBase::testCaseEnded( testCaseStats );
         if( !game_initialized ) {
             return;
         }
@@ -289,7 +288,7 @@ struct CataListener : Catch::TestEventListenerBase {
         weather.clear_temp_cache();
     }
 
-    bool assertionEnded( Catch::AssertionStats const &assertionStats ) override {
+    void assertionEnded( Catch::AssertionStats const &assertionStats ) override {
 #ifdef BACKTRACE
         Catch::AssertionResult const &result = assertionStats.assertionResult;
 
@@ -300,8 +299,6 @@ struct CataListener : Catch::TestEventListenerBase {
             debug_write_backtrace( std::cerr );
         }
 #endif
-
-        return TestEventListenerBase::assertionEnded( assertionStats );
     }
 
 };
@@ -340,7 +337,7 @@ int main( int argc, const char *argv[] )
 
     std::vector<const char *> arg_vec( argv, argv + argc );
 
-    using namespace Catch::clara;
+    using namespace Catch::Clara;
     std::string option_overrides;
     std::string mods_string;
     std::string check_plural_str;

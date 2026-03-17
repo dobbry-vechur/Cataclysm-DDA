@@ -4,8 +4,12 @@ if (BUILD_TESTING)
     file(GLOB CATACLYSM_DDA_TEST_SOURCES
             ${CMAKE_SOURCE_DIR}/tests/*.cpp)
 
-    # Enabling benchmarks
-    add_definitions(-DCATCH_CONFIG_ENABLE_BENCHMARKING)
+    # Catch2 v3 amalgamated implementation (custom main in test_main.cpp)
+    list(APPEND CATACLYSM_DDA_TEST_SOURCES
+            ${CMAKE_SOURCE_DIR}/tests/catch/catch_amalgamated.cpp)
+    set_source_files_properties(
+            ${CMAKE_SOURCE_DIR}/tests/catch/catch_amalgamated.cpp
+            PROPERTIES COMPILE_DEFINITIONS CATCH_AMALGAMATED_CUSTOM_MAIN)
 
     if(LOCALIZE)
         # Need to build the test .mo file for the tests to pass.

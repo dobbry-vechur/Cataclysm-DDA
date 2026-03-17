@@ -8,8 +8,12 @@
 // this file.
 
 // IWYU pragma: begin_exports
-#include "catch/catch.hpp"
+#include "catch/catch_amalgamated.hpp"
 #include "stringmaker.h"
 // IWYU pragma: end_exports
+
+// Catch2 v3 no longer injects Approx into the global namespace.
+// Re-export it here so the 850+ existing call sites don't all need updating.
+using Catch::Approx;
 
 #endif // CATA_TESTS_CATA_CATCH_H

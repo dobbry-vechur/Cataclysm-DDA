@@ -5,7 +5,7 @@
 # We're using the fairly typical convention that any file ending in _test.cpp
 # is a test executable.
 SOURCES = $(wildcard *.cpp)
-OBJS = $(sort $(SOURCES:%.cpp=$(ODIR)/%.o))
+OBJS = $(sort $(SOURCES:%.cpp=$(ODIR)/%.o)) $(ODIR)/catch_amalgamated.o
 
 CATA_LIB=../$(BUILD_PREFIX)cataclysm.a
 
@@ -14,9 +14,6 @@ CATA_LIB=../$(BUILD_PREFIX)cataclysm.a
 ODIR ?= obj
 
 LDFLAGS += -lpthread -L.
-
-# Enabling benchmarks
-DEFINES += -DCATCH_CONFIG_ENABLE_BENCHMARKING
 
 # Allow use of any header files from cataclysm.
 # Catch sections throw unused variable warnings.
@@ -36,7 +33,7 @@ ifndef CLANG
 endif
 
 ifeq ($(PCH), 1)
-PCHFLAGS += -DCATA_CATCH_PCH
+PCHFLAGS +=
 PCH_H = pch/tests-pch.hpp
 ifeq ($(CLANG), 0)
 PCH_P = $(ODIR)/$(PCH_H).gch
@@ -76,6 +73,10 @@ clean:
 
 #Unconditionally create object directory on invocation.
 $(shell mkdir -p $(ODIR) $(dir $(PCH_P)))
+
+# Catch2 amalgamated implementation -- no PCH, no CDDA warnings
+$(ODIR)/catch_amalgamated.o: catch/catch_amalgamated.cpp
+	$(CXX) -I. $(CXXFLAGS) -DCATCH_AMALGAMATED_CUSTOM_MAIN -Wno-error -MMD -MP -c ../tests/$< -o $@
 
 # Adding ../tests/ so that the directory appears in __FILE__ for log messages
 $(ODIR)/%.o: %.cpp $(PCH_P)

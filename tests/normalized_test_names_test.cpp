@@ -9,9 +9,9 @@
 static std::vector<std::string> get_all_test_case_names()
 {
     std::vector<std::string> names;
-    for( const Catch::TestCase &tc :
+    for( const Catch::TestCaseHandle &tc :
          Catch::getAllTestCasesSorted( *Catch::getCurrentContext().getConfig() ) ) {
-        names.push_back( tc.getTestCaseInfo().name );
+        names.push_back( std::string( tc.getTestCaseInfo().name ) );
     }
     return names;
 }
