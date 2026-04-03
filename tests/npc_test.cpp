@@ -4541,6 +4541,177 @@ TEST_CASE( "npc_eat_food_commitment_clears_when_unobtainable", "[npc][needs][for
     CHECK( guy.get_committed_goal() != "eat_food" );
 }
 
+// Executor-level tests for eat_food goal: sticky targets, progress tracking,
+// retargeting, and interaction with follow_player.
+TEST_CASE( "npc_food_executor_contract", "[npc][needs][forage]" )
+{
+    clear_map_without_vision();
+    clear_avatar();
+    get_player_character().camps.clear();
+    get_player_character().setpos( get_map(), tripoint_bub_ms{ 50, 55, 0 } );
+    get_weather().forced_temperature = 20_C;
+    set_time_to_day();
+
+    npc &guy = spawn_npc( { 50, 50 }, "test_talker" );
+    clear_character( guy, true );
+    guy.set_fac( faction_your_followers );
+    guy.set_attitude( NPCATT_FOLLOW );
+    guy.set_stored_kcal( 1000 );
+    guy.set_hunger( -1 );
+    guy.set_thirst( 0 );
+
+    map &here = get_map();
+
+    SECTION( "two equal targets: NPC pursues one, not alternating" ) {
+        const tripoint_bub_ms east = guy.pos_bub() + tripoint( 3, 0, 0 );
+        const tripoint_bub_ms west = guy.pos_bub() + tripoint( -3, 0, 0 );
+        here.ter_set( east, ter_t_underbrush );
+        here.ter_set( west, ter_t_underbrush );
+        here.build_map_cache( 0 );
+        guy.set_committed_goal( "eat_food" );
+
+        int east_moves = 0;
+        int west_moves = 0;
+        tripoint_bub_ms prev = guy.pos_bub();
+        for( int turn = 0; turn < 6; ++turn ) {
+            guy.set_moves( 100 );
+            guy.move();
+            const tripoint_bub_ms cur = guy.pos_bub();
+            if( cur.x() > prev.x() ) {
+                east_moves++;
+            } else if( cur.x() < prev.x() ) {
+                west_moves++;
+            }
+            prev = cur;
+        }
+        // NPC should consistently move in one direction, not both.
+        CHECK( ( east_moves == 0 || west_moves == 0 ) );
+        // And should have actually moved toward a target.
+        CHECK( ( east_moves + west_moves ) > 0 );
+    }
+
+    SECTION( "zero progress for N turns clears or retargets" ) {
+        // Surround an apple tree with walls so it's visible but unreachable.
+        calendar::turn = calendar::turn_zero + 2 * calendar::season_length() + 12_hours;
+        const tripoint_bub_ms tree = guy.pos_bub() + tripoint( 2, 0, 0 );
+        for( const point &d : {
+                 point::north, point::south, point::east, point::west,
+                 point( -1, -1 ), point( 1, -1 ), point( -1, 1 ), point( 1, 1 ), point::zero
+             } ) {
+            if( d != point::zero ) {
+                here.ter_set( tree + d, ter_t_concrete_wall );
+            }
+        }
+        here.ter_set( tree, ter_t_tree_apple );
+        here.build_map_cache( 0 );
+        REQUIRE( here.is_harvestable( tree ) );
+
+        guy.set_committed_goal( "eat_food" );
+        for( int turn = 0; turn < 15; ++turn ) {
+            guy.set_moves( 100 );
+            guy.move();
+        }
+        CHECK( guy.get_committed_goal() != "eat_food" );
+    }
+
+    SECTION( "target becomes invalid mid-plan triggers retarget" ) {
+        const tripoint_bub_ms bush = guy.pos_bub() + tripoint( 3, 0, 0 );
+        here.ter_set( bush, ter_t_underbrush );
+        here.build_map_cache( 0 );
+        guy.set_committed_goal( "eat_food" );
+
+        // Let NPC start pursuing but not reach the bush yet.
+        for( int turn = 0; turn < 2; ++turn ) {
+            guy.set_moves( 100 );
+            guy.move();
+        }
+        REQUIRE_FALSE( guy.activity );
+
+        // Remove the target mid-plan.
+        here.ter_set( bush, ter_t_floor );
+        here.build_map_cache( 0 );
+
+        // Place a new target away from the player path (player is south).
+        const tripoint_bub_ms bush2 = tripoint_bub_ms{ 45, 47, 0 };
+        here.ter_set( bush2, ter_t_underbrush );
+        here.build_map_cache( 0 );
+
+        // NPC should retarget toward bush2 and eventually forage it.
+        for( int turn = 0; turn < 10; ++turn ) {
+            guy.set_moves( 100 );
+            guy.move();
+        }
+        CHECK( rl_dist( guy.pos_bub(), bush2 ) <= 1 );
+        CHECK( ( guy.get_committed_goal() == "eat_food" ||
+                 guy.activity.id() == ACT_FORAGE ) );
+    }
+
+    SECTION( "follow does not regress distance to food target" ) {
+        const tripoint_bub_ms bush = guy.pos_bub() + tripoint( 3, 0, 0 );
+        here.ter_set( bush, ter_t_underbrush );
+        here.build_map_cache( 0 );
+        guy.set_committed_goal( "eat_food" );
+
+        // Net progress: no turn should increase distance to food,
+        // and at least one turn should decrease it.
+        int progress_turns = 0;
+        int regress_turns = 0;
+        int prev_dist = rl_dist( guy.pos_bub(), bush );
+        for( int turn = 0; turn < 5; ++turn ) {
+            guy.set_moves( 100 );
+            guy.move();
+            const int cur_dist = rl_dist( guy.pos_bub(), bush );
+            if( cur_dist < prev_dist ) {
+                progress_turns++;
+            } else if( cur_dist > prev_dist ) {
+                regress_turns++;
+            }
+            prev_dist = cur_dist;
+        }
+        CHECK( regress_turns == 0 );
+        CHECK( progress_turns > 0 );
+    }
+
+    SECTION( "closer food mid-approach does not dither the plan" ) {
+        // NPC starts pursuing a distant bush.
+        const tripoint_bub_ms far_bush = guy.pos_bub() + tripoint( 5, 0, 0 );
+        here.ter_set( far_bush, ter_t_underbrush );
+        here.build_map_cache( 0 );
+        guy.set_committed_goal( "eat_food" );
+
+        // Let NPC start moving east toward far_bush.
+        for( int turn = 0; turn < 2; ++turn ) {
+            guy.set_moves( 100 );
+            guy.move();
+        }
+        REQUIRE( guy.pos_bub().x() > 50 );
+
+        // Drop a closer bush to the north (off the current path).
+        const tripoint_bub_ms near_bush = guy.pos_bub() + tripoint( 0, -2, 0 );
+        here.ter_set( near_bush, ter_t_underbrush );
+        here.build_map_cache( 0 );
+
+        // NPC should keep pursuing the original target, not switch.
+        tripoint_bub_ms prev = guy.pos_bub();
+        int east_moves = 0;
+        int north_moves = 0;
+        for( int turn = 0; turn < 4; ++turn ) {
+            guy.set_moves( 100 );
+            guy.move();
+            const tripoint_bub_ms cur = guy.pos_bub();
+            if( cur.x() > prev.x() ) {
+                east_moves++;
+            }
+            if( cur.y() < prev.y() ) {
+                north_moves++;
+            }
+            prev = cur;
+        }
+        // Should keep going east toward original target, not veer north.
+        CHECK( east_moves > north_moves );
+    }
+}
+
 // Starving NPCs should eat foraged food immediately instead of dropping it.
 TEST_CASE( "npc_eats_foraged_food_immediately", "[npc][needs][forage]" )
 {
