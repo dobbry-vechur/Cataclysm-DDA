@@ -1293,6 +1293,22 @@ TEST_CASE( "npc_camp_water_through_stomach", "[npc][needs][camp]" )
 
         CHECK_FALSE( guy.consume_food_from_camp() );
     }
+
+    SECTION( "calorie-deficit NPC eats camp food even when short-term hunger is zero" ) {
+        // Stock the camp larder with 50 kcal of food.
+        camp_faction->debug_food_supply().emplace_back( calendar::turn_zero, nutrients{} );
+        camp_faction->debug_food_supply().back().second.calories = 50 * 1000;
+        REQUIRE( camp_faction->food_supply().kcal() >= 50 );
+
+        // NPC has severe calorie deficit but no short-term hunger.
+        guy.set_stored_kcal( 1000 );
+        guy.set_hunger( 0 );
+        REQUIRE( guy.has_calorie_deficit() );
+        REQUIRE( guy.get_hunger() <= 0 );
+
+        CHECK( guy.consume_food_from_camp( true ) );
+        CHECK( camp_faction->food_supply().kcal() < 50 );
+    }
 }
 
 TEST_CASE( "npc_nonally_sleeps_when_tired", "[npc][needs]" )
@@ -4714,33 +4730,72 @@ TEST_CASE( "npc_food_executor_contract", "[npc][needs][forage]" )
         CHECK( east_moves > north_moves );
     }
 
+    SECTION( "eat_food executor skips pure-drink items" ) {
+        // NPC is thirsty, so water would normally score in the legacy path.
+        guy.set_thirst( 100 );
+
+        // Water in inventory and on adjacent ground.
+        guy.i_add( item( itype_water_clean ) );
+        const tripoint_bub_ms adj = guy.pos_bub() + point::east;
+        here.add_item( adj, item( itype_water_clean ) );
+        here.build_map_cache( 0 );
+
+        guy.set_moves( 100 );
+        auto result = guy.execute_need_goal( "eat_food" );
+        // Pure drinks don't satisfy eat_food; no food exists, so impossible.
+        CHECK( result == npc::need_result::impossible );
+    }
+
     SECTION( "danger gate defers plan without killing it" ) {
         const tripoint_bub_ms bush = guy.pos_bub() + tripoint( 3, 0, 0 );
         here.ter_set( bush, ter_t_underbrush );
         here.build_map_cache( 0 );
-        guy.set_committed_goal( "eat_food" );
 
-        // Let the NPC acquire a target and start moving.
-        guy.set_moves( 100 );
-        guy.move();
-        REQUIRE( guy.get_committed_goal() == "eat_food" );
-
-        // Raise danger above the gate for several turns.
-        guy.set_ai_danger( NPC_DANGER_VERY_LOW + 1 );
-        for( int turn = 0; turn < 8; ++turn ) {
-            guy.set_moves( 100 );
-            guy.move();
-        }
-        // Plan should still be committed, not cleared as impossible.
-        CHECK( guy.get_committed_goal() == "eat_food" );
-
-        // Drop danger. NPC should resume and reach/forage the target.
+        // Low danger: executor acquires target and moves toward it.
         guy.set_ai_danger( 0 );
-        for( int turn = 0; turn < 3; ++turn ) {
-            guy.set_moves( 100 );
-            guy.move();
-        }
-        CHECK( rl_dist( guy.pos_bub(), bush ) <= 1 );
+        guy.set_moves( 100 );
+        auto result = guy.execute_need_goal( "eat_food" );
+        REQUIRE( result == npc::need_result::progressed );
+        REQUIRE( guy.get_food_plan().active() );
+
+        // High danger: movement is deferred, plan stays alive.
+        guy.set_ai_danger( NPC_DANGER_VERY_LOW + 1 );
+        guy.set_moves( 100 );
+        result = guy.execute_need_goal( "eat_food" );
+        CHECK( result == npc::need_result::deferred );
+        CHECK( guy.get_food_plan().active() );
+
+        // Low danger again: executor resumes progress.
+        guy.set_ai_danger( 0 );
+        guy.set_moves( 100 );
+        result = guy.execute_need_goal( "eat_food" );
+        CHECK( result == npc::need_result::progressed );
+    }
+
+    SECTION( "harvestable plan invalidated when terrain loses food yields" ) {
+        calendar::turn = calendar::turn_zero + 2 * calendar::season_length() + 12_hours;
+        const tripoint_bub_ms tree_pos = guy.pos_bub() + tripoint( 3, 0, 0 );
+        here.ter_set( tree_pos, ter_t_tree_apple );
+        here.build_map_cache( 0 );
+        REQUIRE( here.is_harvestable( tree_pos ) );
+
+        // Executor acquires a harvestable food target.
+        guy.set_moves( 100 );
+        auto result = guy.execute_need_goal( "eat_food" );
+        REQUIRE( result == npc::need_result::progressed );
+        REQUIRE( guy.get_food_plan().active() );
+        using food_source = npc_short_term_cache::food_source;
+        REQUIRE( guy.get_food_plan().source_kind == food_source::harvestable );
+
+        // Change terrain to non-food harvestable (dead tree = sticks only).
+        here.ter_set( tree_pos, ter_t_tree_dead );
+        here.build_map_cache( 0 );
+        REQUIRE( here.is_harvestable( tree_pos ) );
+
+        // Executor should invalidate the stale plan; no other food, so impossible.
+        guy.set_moves( 100 );
+        result = guy.execute_need_goal( "eat_food" );
+        CHECK( result == npc::need_result::impossible );
     }
 }
 

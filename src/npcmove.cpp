@@ -5248,7 +5248,8 @@ bool npc::consume_food_from_camp( bool food_only )
     // Handle food
     int current_kcals = get_stored_kcal() + stomach.get_calories() + guts.get_calories();
     int kcal_threshold = get_healthy_kcal() * 19 / 20;
-    if( get_hunger() > 0 && current_kcals < kcal_threshold && bcp->allowed_access_by( *this ) ) {
+    if( ( get_hunger() > 0 || has_calorie_deficit() ) &&
+        current_kcals < kcal_threshold && bcp->allowed_access_by( *this ) ) {
         // Try to eat a bit more than the bare minimum so that we're not eating every 5 minutes
         // but also don't try to eat a week's worth of food in one sitting
         int desired_kcals = std::min( static_cast<int>( base_metabolic_rate ), std::max( 0,
@@ -5270,7 +5271,7 @@ bool npc::consume_food_from_camp( bool food_only )
     return false;
 }
 
-bool npc::consume_food()
+bool npc::consume_food( bool food_only )
 {
     float best_weight = 0.0f;
     item_location best_food;
@@ -5281,7 +5282,8 @@ bool npc::consume_food()
     if( want_hunger == 0 && has_calorie_deficit() ) {
         want_hunger = 100;
     }
-    int want_quench = std::max( 0, get_thirst() );
+    // food_only: ignore thirst so the scorer only ranks by nutritional value.
+    int want_quench = food_only ? 0 : std::max( 0, get_thirst() );
 
     const std::vector<item_location> inv_food = cache_get_items_with( "is_food", &item::is_food );
 
@@ -5293,6 +5295,13 @@ bool npc::consume_food()
         }
     } else {
         for( const item_location &food_item : inv_food ) {
+            // In food_only mode, skip items with no nutritional value (pure drinks).
+            if( food_only ) {
+                const auto &com = food_item->get_comestible();
+                if( !com || com->get_default_nutr() <= 0 ) {
+                    continue;
+                }
+            }
             float cur_weight = rate_food( *this, *food_item, want_hunger, want_quench );
             // Note: will_eat is expensive, avoid calling it if possible
             if( cur_weight > best_weight && will_eat( *food_item ).success() ) {
@@ -6137,7 +6146,7 @@ std::vector<npc::scored_water_source> npc::find_nearby_water_sources() const
     return results;
 }
 
-std::vector<npc::scored_item> npc::find_nearby_food()
+std::vector<npc::scored_item> npc::find_nearby_food( bool food_only )
 {
     std::vector<scored_item> results;
     if( is_player_ally() && !rules.has_flag( ally_rule::allow_pick_up ) ) {
@@ -6147,7 +6156,8 @@ std::vector<npc::scored_item> npc::find_nearby_food()
     if( want_hunger == 0 && has_calorie_deficit() ) {
         want_hunger = 100;
     }
-    const int want_quench = std::max( 0, get_thirst() );
+    // food_only: ignore thirst so the scorer only ranks by nutritional value.
+    const int want_quench = food_only ? 0 : std::max( 0, get_thirst() );
     map &here = get_map();
 
     static const std::string locked_string( "LOCKED" );
@@ -6159,6 +6169,14 @@ std::vector<npc::scored_item> npc::find_nearby_food()
         if( !it.is_food() )
         {
             return false;
+        }
+        // In food_only mode, skip items with no nutritional value (pure drinks).
+        if( food_only )
+        {
+            const auto &com = it.get_comestible();
+            if( !com || com->get_default_nutr() <= 0 ) {
+                return false;
+            }
         }
         if( !would_take_that( it, p ) )
         {
@@ -6453,13 +6471,13 @@ npc::need_result npc::execute_need_goal( const std::string &goal )
         plan.clear();
         return need_result::satisfied;
     }
-    if( consume_food() ) {
+    if( consume_food( true ) ) {
         plan.clear();
         return need_result::satisfied;
     }
     {
         map &food_map = get_map();
-        for( scored_item &c : find_nearby_food() ) {
+        for( scored_item &c : find_nearby_food( true ) ) {
             if( square_dist( pos_bub(), c.loc.pos_bub( food_map ) ) <= 1 ) {
                 if( consume_food_at( c.loc ) ) {
                     plan.clear();
@@ -6478,15 +6496,14 @@ npc::need_result npc::execute_need_goal( const std::string &goal )
         if( plan.source_kind == food_source::ground_item ) {
             // Check ground items and vehicle cargo at the target tile.
             still_valid = false;
-            for( const scored_item &c : find_nearby_food() ) {
+            for( const scored_item &c : find_nearby_food( true ) ) {
                 if( here.get_abs( c.loc.pos_bub( here ) ) == plan.target ) {
                     still_valid = true;
                     break;
                 }
             }
         } else if( plan.source_kind == food_source::harvestable ) {
-            still_valid = here.is_harvestable( target_bub ) ||
-                          here.ter( target_bub ).obj().has_examine( iexamine::shrub_wildveggies );
+            still_valid = harvest_yields_food( here, target_bub );
         }
         if( !still_valid ) {
             plan.clear();
@@ -6497,7 +6514,7 @@ npc::need_result npc::execute_need_goal( const std::string &goal )
     //    Priority: distant ground food first, then harvestable terrain.
     if( !plan.active() ) {
         // Ground food (same scan as address_needs extreme path).
-        for( const scored_item &c : find_nearby_food() ) {
+        for( const scored_item &c : find_nearby_food( true ) ) {
             plan.goal = goal;
             plan.source_kind = food_source::ground_item;
             plan.target = here.get_abs( c.loc.pos_bub( here ) );
@@ -6530,7 +6547,7 @@ npc::need_result npc::execute_need_goal( const std::string &goal )
         if( square_dist( pos_bub(), target_bub ) <= 1 ) {
             // Try consuming from the same scan that find_nearby_food uses
             // (covers both ground items and vehicle cargo).
-            for( scored_item &c : find_nearby_food() ) {
+            for( scored_item &c : find_nearby_food( true ) ) {
                 if( here.get_abs( c.loc.pos_bub( here ) ) == plan.target &&
                     consume_food_at( c.loc ) ) {
                     plan.clear();

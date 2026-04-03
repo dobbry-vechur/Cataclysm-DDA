@@ -1193,7 +1193,7 @@ class npc : public Character
             int dist;
         };
         std::vector<scored_water_source> find_nearby_water_sources() const;
-        std::vector<scored_item> find_nearby_food();
+        std::vector<scored_item> find_nearby_food( bool food_only = false );
         std::vector<scored_item> find_nearby_warm_clothing();
         std::vector<scored_shelter> find_nearby_shelters() const;
         std::vector<scored_water_source> find_nearby_harvestable( bool food_only = false ) const;
@@ -1314,7 +1314,7 @@ class npc : public Character
         // Do we have an idea of where u are?
         bool saw_player_recently() const;
         /** Returns true if food was consumed, false otherwise. */
-        bool consume_food();
+        bool consume_food( bool food_only = false );
         bool consume_food_from_camp( bool food_only = false );
         int get_thirst() const override;
 
