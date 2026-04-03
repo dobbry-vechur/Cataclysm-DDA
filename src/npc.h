@@ -591,6 +591,16 @@ struct npc_short_term_cache {
     // Filter for consume_food / find_nearby_food / consume_food_from_camp.
     enum class consume_filter : int { any, food_only, drink_only };
 
+    // Shared candidate for the query layer between BT predicates and
+    // executor target acquisition. Carries the same scores as the
+    // executor's find_nearby_food/find_nearby_water_sources helpers
+    // so the selection policy is not lost.
+    struct need_candidate {
+        need_source source_kind = need_source::none;
+        tripoint_abs_ms target;
+        float score = 0.0f;
+    };
+
     // Cache of locations the NPC has searched recently in npc::find_item()
     lru_cache<tripoint_abs_ms, int> searched_tiles;
     // returns the value of the distance between a friendly creature and the closest enemy to that
@@ -1198,6 +1208,13 @@ class npc : public Character
         };
         std::vector<scored_water_source> find_nearby_water_sources() const;
         using consume_filter = npc_short_term_cache::consume_filter;
+        using need_candidate = npc_short_term_cache::need_candidate;
+        // Shared query layer: both BT predicates and executor target
+        // acquisition use these, so policy (visibility, locks, zones,
+        // will_eat, rate_food) is defined in one place. Non-const because
+        // the underlying will_eat/rate_food calls are not const-qualified.
+        std::vector<need_candidate> find_food_candidates();
+        std::vector<need_candidate> find_water_candidates();
         std::vector<scored_item> find_nearby_food( consume_filter filter = consume_filter::any );
         std::vector<scored_item> find_nearby_warm_clothing();
         std::vector<scored_shelter> find_nearby_shelters() const;

@@ -6486,6 +6486,61 @@ std::vector<npc::scored_water_source> npc::find_nearby_harvestable( bool food_on
     return results;
 }
 
+std::vector<npc::need_candidate> npc::find_food_candidates()
+{
+    std::vector<need_candidate> candidates;
+    map &here = get_map();
+
+    // Ground food items: same filter chain as the executor's consumption
+    // path (would_take_that, rate_food, will_eat). Already sorted by
+    // descending score from find_nearby_food().
+    for( const scored_item &si : find_nearby_food( consume_filter::food_only ) ) {
+        candidates.push_back( {
+            need_source::ground_item,
+            here.get_abs( si.loc.pos_bub( here ) ),
+            si.score
+        } );
+    }
+
+    // Harvestable terrain (food-yielding only). Score by negative distance
+    // so closer sources rank higher, but all rank below scored ground items.
+    for( const scored_water_source &h : find_nearby_harvestable( true ) ) {
+        candidates.push_back( {
+            need_source::harvestable,
+            here.get_abs( h.pos ),
+            -static_cast<float>( h.dist )
+        } );
+    }
+
+    return candidates;
+}
+
+std::vector<npc::need_candidate> npc::find_water_candidates()
+{
+    std::vector<need_candidate> candidates;
+    map &here = get_map();
+
+    // Ground drink items: same filter chain as find_nearby_food.
+    for( const scored_item &si : find_nearby_food( consume_filter::drink_only ) ) {
+        candidates.push_back( {
+            need_source::ground_item,
+            here.get_abs( si.loc.pos_bub( here ) ),
+            si.score
+        } );
+    }
+
+    // Water terrain sources (wells, rivers). Score by negative distance.
+    for( const scored_water_source &ws : find_nearby_water_sources() ) {
+        candidates.push_back( {
+            need_source::water_terrain,
+            here.get_abs( ws.pos ),
+            -static_cast<float>( ws.dist )
+        } );
+    }
+
+    return candidates;
+}
+
 npc::need_result npc::execute_need_goal( const std::string &goal )
 {
     if( goal == "eat_food" ) {
@@ -6531,50 +6586,30 @@ npc::need_result npc::execute_eat_food()
 
     using need_source = npc_short_term_cache::need_source;
 
-    // 2. Validate existing target.
+    const auto candidates = find_food_candidates();
+
+    // 2. Validate existing target against the candidate scan.
     if( plan.active() ) {
-        const tripoint_bub_ms target_bub = here.get_bub( plan.target );
         bool still_valid = false;
-        if( plan.source_kind == need_source::ground_item ) {
-            // Check ground items and vehicle cargo at the target tile.
-            still_valid = false;
-            for( const scored_item &c : find_nearby_food( cf ) ) {
-                if( here.get_abs( c.loc.pos_bub( here ) ) == plan.target ) {
-                    still_valid = true;
-                    break;
-                }
+        for( const need_candidate &c : candidates ) {
+            if( c.target == plan.target && c.source_kind == plan.source_kind ) {
+                still_valid = true;
+                break;
             }
-        } else if( plan.source_kind == need_source::harvestable ) {
-            still_valid = harvest_yields_food( here, target_bub );
         }
         if( !still_valid ) {
             plan.clear();
         }
     }
 
-    // 3. Acquire target if we don't have one.
-    //    Priority: distant ground food first, then harvestable terrain.
-    if( !plan.active() ) {
-        // Ground food (same scan as address_needs extreme path).
-        for( const scored_item &c : find_nearby_food( cf ) ) {
-            plan.goal = "eat_food";
-            plan.source_kind = need_source::ground_item;
-            plan.target = here.get_abs( c.loc.pos_bub( here ) );
-            plan.last_result = need_result::idle;
-            plan.no_progress_turns = 0;
-            break;
-        }
-    }
-    if( !plan.active() ) {
-        // Harvestable terrain (food-yielding only).
-        const auto sources = find_nearby_harvestable( true );
-        if( !sources.empty() ) {
-            plan.goal = "eat_food";
-            plan.source_kind = need_source::harvestable;
-            plan.target = here.get_abs( sources.front().pos );
-            plan.last_result = need_result::idle;
-            plan.no_progress_turns = 0;
-        }
+    // 3. Acquire target from scored candidates (ground items sorted by
+    //    rate_food, then harvestable by distance).
+    if( !plan.active() && !candidates.empty() ) {
+        plan.goal = "eat_food";
+        plan.source_kind = candidates.front().source_kind;
+        plan.target = candidates.front().target;
+        plan.last_result = need_result::idle;
+        plan.no_progress_turns = 0;
     }
     if( !plan.active() ) {
         plan.clear();
@@ -6587,8 +6622,6 @@ npc::need_result npc::execute_eat_food()
 
     if( plan.source_kind == need_source::ground_item ) {
         if( square_dist( pos_bub(), target_bub ) <= 1 ) {
-            // Try consuming from the same scan that find_nearby_food uses
-            // (covers both ground items and vehicle cargo).
             for( scored_item &c : find_nearby_food( cf ) ) {
                 if( here.get_abs( c.loc.pos_bub( here ) ) == plan.target &&
                     consume_food_at( c.loc ) ) {
@@ -6673,46 +6706,30 @@ npc::need_result npc::execute_drink_water()
 
     using need_source = npc_short_term_cache::need_source;
 
-    // 2. Validate existing target.
+    const auto candidates = find_water_candidates();
+
+    // 2. Validate existing target against the candidate scan.
     if( plan.active() ) {
-        const tripoint_bub_ms target_bub = here.get_bub( plan.target );
         bool still_valid = false;
-        if( plan.source_kind == need_source::ground_item ) {
-            for( const scored_item &c : find_nearby_food( cf ) ) {
-                if( here.get_abs( c.loc.pos_bub( here ) ) == plan.target ) {
-                    still_valid = true;
-                    break;
-                }
+        for( const need_candidate &c : candidates ) {
+            if( c.target == plan.target && c.source_kind == plan.source_kind ) {
+                still_valid = true;
+                break;
             }
-        } else if( plan.source_kind == need_source::water_terrain ) {
-            still_valid = is_allowed_water_source( here.ter( target_bub ).obj() );
         }
         if( !still_valid ) {
             plan.clear();
         }
     }
 
-    // 3. Acquire target if we don't have one.
-    //    Priority: ground drink items first, then water terrain.
-    if( !plan.active() ) {
-        for( const scored_item &c : find_nearby_food( cf ) ) {
-            plan.goal = "drink_water";
-            plan.source_kind = need_source::ground_item;
-            plan.target = here.get_abs( c.loc.pos_bub( here ) );
-            plan.last_result = need_result::idle;
-            plan.no_progress_turns = 0;
-            break;
-        }
-    }
-    if( !plan.active() ) {
-        for( const scored_water_source &ws : find_nearby_water_sources() ) {
-            plan.goal = "drink_water";
-            plan.source_kind = need_source::water_terrain;
-            plan.target = here.get_abs( ws.pos );
-            plan.last_result = need_result::idle;
-            plan.no_progress_turns = 0;
-            break;
-        }
+    // 3. Acquire target from scored candidates (ground drinks sorted by
+    //    rate_food, then water terrain by distance).
+    if( !plan.active() && !candidates.empty() ) {
+        plan.goal = "drink_water";
+        plan.source_kind = candidates.front().source_kind;
+        plan.target = candidates.front().target;
+        plan.last_result = need_result::idle;
+        plan.no_progress_turns = 0;
     }
     if( !plan.active() ) {
         plan.clear();

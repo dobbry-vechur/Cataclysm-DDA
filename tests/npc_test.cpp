@@ -4901,6 +4901,193 @@ TEST_CASE( "npc_can_obtain_food_filters_harvests", "[npc][needs][forage]" )
     }
 }
 
+// Candidate query layer tests: verify find_food_candidates / find_water_candidates
+// match the policy checks that predicates and executors share.
+TEST_CASE( "npc_find_food_candidates", "[npc][needs][forage]" )
+{
+    clear_map_without_vision();
+    clear_avatar();
+    get_player_character().camps.clear();
+    set_time_to_day();
+    calendar::turn = calendar::turn_zero + 2 * calendar::season_length() + 12_hours;
+
+    npc &guy = spawn_npc( { 50, 50 }, "test_talker" );
+    clear_character( guy, true );
+    guy.set_hunger( 300 );
+    guy.set_thirst( 100 );
+    guy.set_stored_kcal( 1000 );
+
+    map &here = get_map();
+    const tripoint_bub_ms adj = guy.pos_bub() + point::east;
+    REQUIRE_FALSE( guy.is_player_ally() );
+
+    using need_source = npc_short_term_cache::need_source;
+
+    SECTION( "ground food item yields ground_item candidate" ) {
+        here.add_item_or_charges( adj, item( itype_sandwich_cheese_grilled ) );
+        here.build_map_cache( 0 );
+        auto cands = guy.find_food_candidates();
+        REQUIRE_FALSE( cands.empty() );
+        CHECK( cands.front().source_kind == need_source::ground_item );
+        CHECK( cands.front().target == here.get_abs( adj ) );
+    }
+
+    SECTION( "harvestable terrain yields harvestable candidate" ) {
+        here.ter_set( adj, ter_t_underbrush );
+        here.build_map_cache( 0 );
+        auto cands = guy.find_food_candidates();
+        REQUIRE_FALSE( cands.empty() );
+        CHECK( cands.front().source_kind == need_source::harvestable );
+    }
+
+    SECTION( "non-food harvestable excluded" ) {
+        here.ter_set( adj, ter_t_tree_dead );
+        here.build_map_cache( 0 );
+        REQUIRE( here.is_harvestable( adj ) );
+        CHECK( guy.find_food_candidates().empty() );
+    }
+
+    SECTION( "drink-only item excluded (no calories)" ) {
+        item water_item( itype_water_clean );
+        REQUIRE( water_item.is_food() );
+        REQUIRE( water_item.get_comestible() );
+        REQUIRE_FALSE( water_item.get_comestible()->has_calories() );
+        here.add_item_or_charges( adj, water_item );
+        here.build_map_cache( 0 );
+        CHECK( guy.find_food_candidates().empty() );
+    }
+
+    SECTION( "ally without allow_pick_up skips ground items" ) {
+        guy.set_fac( faction_your_followers );
+        guy.set_attitude( NPCATT_FOLLOW );
+        REQUIRE( guy.is_player_ally() );
+        guy.rules.clear_flag( ally_rule::allow_pick_up );
+        here.add_item_or_charges( adj, item( itype_sandwich_cheese_grilled ) );
+        here.build_map_cache( 0 );
+        CHECK( guy.find_food_candidates().empty() );
+    }
+
+    SECTION( "ally without allow_pick_up still finds harvestable" ) {
+        guy.set_fac( faction_your_followers );
+        guy.set_attitude( NPCATT_FOLLOW );
+        REQUIRE( guy.is_player_ally() );
+        guy.rules.clear_flag( ally_rule::allow_pick_up );
+        here.ter_set( adj, ter_t_underbrush );
+        here.build_map_cache( 0 );
+        auto cands = guy.find_food_candidates();
+        REQUIRE_FALSE( cands.empty() );
+        CHECK( cands.front().source_kind == need_source::harvestable );
+    }
+
+    SECTION( "NO_NPC_PICKUP zone blocks ground items" ) {
+        guy.set_fac( faction_your_followers );
+        guy.set_attitude( NPCATT_FOLLOW );
+        REQUIRE( guy.is_player_ally() );
+        const tripoint_abs_ms abs_adj = here.get_abs( adj );
+        mapgen_place_zone( abs_adj, abs_adj, zone_type_NO_NPC_PICKUP,
+                           faction_your_followers, {}, "no_pickup" );
+        here.add_item_or_charges( adj, item( itype_sandwich_cheese_grilled ) );
+        here.build_map_cache( 0 );
+        CHECK( guy.find_food_candidates().empty() );
+    }
+
+    SECTION( "can_obtain_food predicate sees ground food" ) {
+        here.add_item_or_charges( adj, item( itype_sandwich_cheese_grilled ) );
+        here.build_map_cache( 0 );
+        behavior::character_oracle_t oracle( &guy );
+        CHECK( oracle.can_obtain_food( "" ) == behavior::status_t::running );
+    }
+
+    SECTION( "empty map yields no candidates" ) {
+        here.build_map_cache( 0 );
+        CHECK( guy.find_food_candidates().empty() );
+    }
+}
+
+TEST_CASE( "npc_find_water_candidates", "[npc][needs][water]" )
+{
+    clear_map_without_vision();
+    clear_avatar();
+    get_player_character().camps.clear();
+    set_time_to_day();
+
+    npc &guy = spawn_npc( { 50, 50 }, "test_talker" );
+    clear_character( guy, true );
+    guy.set_hunger( 100 );
+    guy.set_thirst( 200 );
+    guy.set_stored_kcal( 5000 );
+
+    map &here = get_map();
+    const tripoint_bub_ms adj = guy.pos_bub() + point::east;
+    REQUIRE_FALSE( guy.is_player_ally() );
+
+    using need_source = npc_short_term_cache::need_source;
+
+    SECTION( "water terrain yields water_terrain candidate" ) {
+        here.ter_set( adj, ter_t_water_sh );
+        here.build_map_cache( 0 );
+        auto cands = guy.find_water_candidates();
+        REQUIRE_FALSE( cands.empty() );
+        CHECK( cands.front().source_kind == need_source::water_terrain );
+        CHECK( cands.front().target == here.get_abs( adj ) );
+    }
+
+    SECTION( "ground drink item yields ground_item candidate" ) {
+        // Orange has quench > 0 and is a solid item that persists on
+        // bare ground. Liquids (water_clean) may not, so use a food
+        // item that also hydrates.
+        here.add_item_or_charges( adj, item( itype_orange ) );
+        here.build_map_cache( 0 );
+        auto cands = guy.find_water_candidates();
+        REQUIRE_FALSE( cands.empty() );
+        CHECK( cands.front().source_kind == need_source::ground_item );
+    }
+
+    SECTION( "salt water excluded" ) {
+        here.ter_set( adj, ter_t_swater_sh );
+        here.build_map_cache( 0 );
+        CHECK( guy.find_water_candidates().empty() );
+    }
+
+    SECTION( "food with no quench excluded" ) {
+        item food( itype_crackers );
+        REQUIRE( food.is_food() );
+        REQUIRE( food.get_comestible()->quench <= 0 );
+        here.add_item_or_charges( adj, food );
+        here.build_map_cache( 0 );
+        CHECK( guy.find_water_candidates().empty() );
+    }
+
+    SECTION( "ally without allow_pick_up skips ground drinks but finds water terrain" ) {
+        guy.set_fac( faction_your_followers );
+        guy.set_attitude( NPCATT_FOLLOW );
+        REQUIRE( guy.is_player_ally() );
+        guy.rules.clear_flag( ally_rule::allow_pick_up );
+        here.add_item_or_charges( adj, item( itype_orange ) );
+        tripoint_bub_ms adj2 = guy.pos_bub() + point::west;
+        here.ter_set( adj2, ter_t_water_sh );
+        here.build_map_cache( 0 );
+        auto cands = guy.find_water_candidates();
+        REQUIRE_FALSE( cands.empty() );
+        // All candidates should be water_terrain, not ground_item.
+        for( const auto &c : cands ) {
+            CHECK( c.source_kind == need_source::water_terrain );
+        }
+    }
+
+    SECTION( "can_obtain_water predicate sees ground drink items" ) {
+        here.add_item_or_charges( adj, item( itype_orange ) );
+        here.build_map_cache( 0 );
+        behavior::character_oracle_t oracle( &guy );
+        CHECK( oracle.can_obtain_water( "" ) == behavior::status_t::running );
+    }
+
+    SECTION( "empty map yields no candidates" ) {
+        here.build_map_cache( 0 );
+        CHECK( guy.find_water_candidates().empty() );
+    }
+}
+
 // Executor-level tests for drink_water goal: water terrain sources,
 // inventory drinks, drink-only filtering, sticky targets, progress tracking.
 TEST_CASE( "npc_water_executor_contract", "[npc][needs][water]" )
