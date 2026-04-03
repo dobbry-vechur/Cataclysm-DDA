@@ -1524,13 +1524,13 @@ TEST_CASE( "npc_find_nearby_food", "[npc][needs]" )
         CHECK( guy.find_nearby_food().empty() );
     }
 
-    SECTION( "ally without allow_pick_up returns empty" ) {
+    SECTION( "ally without allow_pick_up still finds food for consumption" ) {
         guy.set_fac( faction_your_followers );
         guy.set_attitude( NPCATT_FOLLOW );
         REQUIRE( guy.is_player_ally() );
         guy.rules.clear_flag( ally_rule::allow_pick_up );
         here.add_item_or_charges( adj, item( itype_sandwich_cheese_grilled ) );
-        CHECK( guy.find_nearby_food().empty() );
+        CHECK_FALSE( guy.find_nearby_food().empty() );
     }
 
     SECTION( "ally skips food in NO_NPC_PICKUP zone" ) {
@@ -4797,6 +4797,111 @@ TEST_CASE( "npc_food_executor_contract", "[npc][needs][forage]" )
         result = guy.execute_need_goal( "eat_food" );
         CHECK( result == npc::need_result::impossible );
     }
+
+    SECTION( "closer unreachable target skipped for farther reachable one" ) {
+        calendar::turn = calendar::turn_zero + 2 * calendar::season_length() + 12_hours;
+        using need_source = npc_short_term_cache::need_source;
+
+        // Close tree behind glass (visible through glass, but impassable
+        // without bashing, and executor should not bash for normal food).
+        const tripoint_bub_ms close = guy.pos_bub() + tripoint( 2, 0, 0 );
+        for( const point &d : {
+                 point::north, point::south, point::east, point::west,
+                 point( -1, -1 ), point( 1, -1 ), point( -1, 1 ), point( 1, 1 )
+             } ) {
+            here.ter_set( close + d, ter_t_wall_glass );
+        }
+        here.ter_set( close, ter_t_tree_apple );
+
+        // Far tree in the open (reachable).
+        const tripoint_bub_ms far = guy.pos_bub() + tripoint( 0, -5, 0 );
+        here.ter_set( far, ter_t_tree_apple );
+        here.build_map_cache( 0 );
+        REQUIRE( here.is_harvestable( close ) );
+        REQUIRE( here.is_harvestable( far ) );
+
+        // The close tree must be the first candidate (closer = higher score).
+        auto cands = guy.find_food_candidates();
+        REQUIRE( cands.size() >= 2 );
+        REQUIRE( cands.front().target == here.get_abs( close ) );
+
+        // Drive the executor directly. The close tree should produce
+        // no progress (no-bash policy for non-critical food) and time out.
+        for( int turn = 0; turn < 5; ++turn ) {
+            guy.set_moves( 100 );
+            guy.execute_need_goal( "eat_food" );
+        }
+        REQUIRE( guy.get_food_plan().last_result == npc::need_result::impossible );
+
+        // Next call should skip the failed close tree and target the far one.
+        guy.set_moves( 100 );
+        auto result = guy.execute_need_goal( "eat_food" );
+        CHECK( guy.get_food_plan().active() );
+        CHECK( guy.get_food_plan().target == here.get_abs( far ) );
+        CHECK( guy.get_food_plan().source_kind == need_source::harvestable );
+        CHECK( result == npc::need_result::progressed );
+    }
+
+    SECTION( "failed target becomes reachable after generation reset" ) {
+        calendar::turn = calendar::turn_zero + 2 * calendar::season_length() + 12_hours;
+
+        // Single tree behind glass (visible, unreachable without bashing).
+        const tripoint_bub_ms tree = guy.pos_bub() + tripoint( 2, 0, 0 );
+        for( const point &d : {
+                 point::north, point::south, point::east, point::west,
+                 point( -1, -1 ), point( 1, -1 ), point( -1, 1 ), point( 1, 1 )
+             } ) {
+            here.ter_set( tree + d, ter_t_wall_glass );
+        }
+        here.ter_set( tree, ter_t_tree_apple );
+        here.build_map_cache( 0 );
+        REQUIRE( here.is_harvestable( tree ) );
+
+        // Exhaust the target: 5 turns of no-progress, then impossible.
+        for( int turn = 0; turn < 5; ++turn ) {
+            guy.set_moves( 100 );
+            guy.execute_need_goal( "eat_food" );
+        }
+        REQUIRE( guy.get_food_plan().last_result == npc::need_result::impossible );
+
+        // Next call: only candidate is in the failed set, so the
+        // generation resets and returns impossible with a clean slate.
+        guy.set_moves( 100 );
+        guy.execute_need_goal( "eat_food" );
+        REQUIRE( guy.get_food_plan().last_result == npc::need_result::impossible );
+
+        // Remove the glass walls so the tree becomes reachable.
+        for( const point &d : {
+                 point::north, point::south, point::east, point::west,
+                 point( -1, -1 ), point( 1, -1 ), point( -1, 1 ), point( 1, 1 )
+             } ) {
+            here.ter_set( tree + d, ter_t_floor );
+        }
+        here.build_map_cache( 0 );
+
+        // The executor should now acquire the formerly-failed tree
+        // and make progress toward it.
+        guy.set_moves( 100 );
+        auto result = guy.execute_need_goal( "eat_food" );
+        CHECK( guy.get_food_plan().active() );
+        CHECK( guy.get_food_plan().target == here.get_abs( tree ) );
+        CHECK( result == npc::need_result::progressed );
+    }
+
+    SECTION( "pickup disabled ally eats adjacent ground food" ) {
+        guy.rules.clear_flag( ally_rule::allow_pick_up );
+
+        const tripoint_bub_ms adj = guy.pos_bub() + point::east;
+        here.add_item_or_charges( adj, item( itype_sandwich_cheese_grilled ) );
+        here.build_map_cache( 0 );
+
+        const int kcal_before = guy.get_stored_kcal();
+        guy.set_moves( 100 );
+        auto result = guy.execute_need_goal( "eat_food" );
+        // The NPC should eat the adjacent food, not return impossible.
+        CHECK( result == npc::need_result::satisfied );
+        CHECK( guy.get_stored_kcal() + guy.stomach.get_calories() > kcal_before );
+    }
 }
 
 // Starving NPCs should eat foraged food immediately instead of dropping it.
@@ -4957,14 +5062,16 @@ TEST_CASE( "npc_find_food_candidates", "[npc][needs][forage]" )
         CHECK( guy.find_food_candidates().empty() );
     }
 
-    SECTION( "ally without allow_pick_up skips ground items" ) {
+    SECTION( "ally without allow_pick_up still finds ground items for consumption" ) {
         guy.set_fac( faction_your_followers );
         guy.set_attitude( NPCATT_FOLLOW );
         REQUIRE( guy.is_player_ally() );
         guy.rules.clear_flag( ally_rule::allow_pick_up );
         here.add_item_or_charges( adj, item( itype_sandwich_cheese_grilled ) );
         here.build_map_cache( 0 );
-        CHECK( guy.find_food_candidates().empty() );
+        auto cands = guy.find_food_candidates();
+        REQUIRE_FALSE( cands.empty() );
+        CHECK( cands.front().source_kind == need_source::ground_item );
     }
 
     SECTION( "ally without allow_pick_up still finds harvestable" ) {
@@ -5058,7 +5165,7 @@ TEST_CASE( "npc_find_water_candidates", "[npc][needs][water]" )
         CHECK( guy.find_water_candidates().empty() );
     }
 
-    SECTION( "ally without allow_pick_up skips ground drinks but finds water terrain" ) {
+    SECTION( "ally without allow_pick_up finds both ground drinks and water terrain" ) {
         guy.set_fac( faction_your_followers );
         guy.set_attitude( NPCATT_FOLLOW );
         REQUIRE( guy.is_player_ally() );
@@ -5069,10 +5176,18 @@ TEST_CASE( "npc_find_water_candidates", "[npc][needs][water]" )
         here.build_map_cache( 0 );
         auto cands = guy.find_water_candidates();
         REQUIRE_FALSE( cands.empty() );
-        // All candidates should be water_terrain, not ground_item.
+        // Should find both ground drinks and water terrain now.
+        bool has_ground = false;
+        bool has_terrain = false;
         for( const auto &c : cands ) {
-            CHECK( c.source_kind == need_source::water_terrain );
+            if( c.source_kind == need_source::ground_item ) {
+                has_ground = true;
+            } else if( c.source_kind == need_source::water_terrain ) {
+                has_terrain = true;
+            }
         }
+        CHECK( has_ground );
+        CHECK( has_terrain );
     }
 
     SECTION( "can_obtain_water predicate sees ground drink items" ) {

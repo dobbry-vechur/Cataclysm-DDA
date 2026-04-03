@@ -1730,6 +1730,7 @@ void npc::move()
                     completed_goal = satisfied || exec_impossible;
                     if( completed_goal ) {
                         ai_cache.food_plan.clear();
+                        ai_cache.food_failed_targets.clear();
                     }
                 } else if( committed == "drink_water" ) {
                     behavior::character_oracle_t oracle( this );
@@ -1739,6 +1740,7 @@ void npc::move()
                     completed_goal = satisfied || exec_impossible;
                     if( completed_goal ) {
                         ai_cache.water_plan.clear();
+                        ai_cache.water_failed_targets.clear();
                     }
                 } else if( committed == "camp_work" ) {
                     completed_goal = ( new_goal != "camp_work" );
@@ -1757,8 +1759,10 @@ void npc::move()
                         // Clear stale plan when overridden by higher priority.
                         if( committed == "eat_food" ) {
                             ai_cache.food_plan.clear();
+                            ai_cache.food_failed_targets.clear();
                         } else if( committed == "drink_water" ) {
                             ai_cache.water_plan.clear();
+                            ai_cache.water_failed_targets.clear();
                         }
                         committed = new_goal;
                     } else {
@@ -6170,9 +6174,9 @@ std::vector<npc::scored_water_source> npc::find_nearby_water_sources() const
 std::vector<npc::scored_item> npc::find_nearby_food( consume_filter filter )
 {
     std::vector<scored_item> results;
-    if( is_player_ally() && !rules.has_flag( ally_rule::allow_pick_up ) ) {
-        return results;
-    }
+    // Note: allow_pick_up is not checked here. All callers of this function
+    // consume food in place (via consume_food_at), not pick up for storage.
+    // The NO_NPC_PICKUP zone check and ownership filters below still apply.
     int want_hunger = std::max( 0, get_hunger() );
     if( want_hunger == 0 && has_calorie_deficit() ) {
         want_hunger = 100;
@@ -6384,13 +6388,13 @@ bool npc::wear_item_at( item_location loc )
     return wear( loc, false ).has_value();
 }
 
-bool npc::move_to_and_verify( const tripoint_bub_ms &target )
+bool npc::move_to_and_verify( const tripoint_bub_ms &target, bool no_bashing )
 {
     const std::optional<tripoint_bub_ms> dest = nearest_passable( target, pos_bub() );
     if( !dest ) {
         return false;
     }
-    update_path( *dest );
+    update_path( *dest, no_bashing );
     if( path.empty() && rl_dist( pos_bub(), *dest ) > 1 ) {
         return false;
     }
@@ -6562,14 +6566,18 @@ npc::need_result npc::execute_eat_food()
     need_plan &plan = ai_cache.food_plan;
     map &here = get_map();
 
+    std::set<tripoint_abs_ms> &failed = ai_cache.food_failed_targets;
+
     // 1. Try camp food (calories only, skip the water path),
     //    inventory food, then adjacent ground food.
     if( consume_food_from_camp( cf ) ) {
         plan.clear();
+        failed.clear();
         return need_result::satisfied;
     }
     if( consume_food( cf ) ) {
         plan.clear();
+        failed.clear();
         return need_result::satisfied;
     }
     {
@@ -6578,6 +6586,7 @@ npc::need_result npc::execute_eat_food()
             if( square_dist( pos_bub(), c.loc.pos_bub( food_map ) ) <= 1 ) {
                 if( consume_food_at( c.loc ) ) {
                     plan.clear();
+                    failed.clear();
                     return need_result::satisfied;
                 }
             }
@@ -6602,14 +6611,24 @@ npc::need_result npc::execute_eat_food()
         }
     }
 
-    // 3. Acquire target from scored candidates (ground items sorted by
-    //    rate_food, then harvestable by distance).
+    // 3. Acquire target from scored candidates, skipping any that
+    //    previously hit the no-progress timeout.
     if( !plan.active() && !candidates.empty() ) {
-        plan.goal = "eat_food";
-        plan.source_kind = candidates.front().source_kind;
-        plan.target = candidates.front().target;
-        plan.last_result = need_result::idle;
-        plan.no_progress_turns = 0;
+        for( const need_candidate &c : candidates ) {
+            if( failed.count( c.target ) == 0 ) {
+                plan.goal = "eat_food";
+                plan.source_kind = c.source_kind;
+                plan.target = c.target;
+                plan.last_result = need_result::idle;
+                plan.no_progress_turns = 0;
+                break;
+            }
+        }
+        if( !plan.active() ) {
+            // All candidates exhausted this generation. Clear the
+            // blacklist so the next attempt retries everything fresh.
+            failed.clear();
+        }
     }
     if( !plan.active() ) {
         plan.clear();
@@ -6626,10 +6645,11 @@ npc::need_result npc::execute_eat_food()
                 if( here.get_abs( c.loc.pos_bub( here ) ) == plan.target &&
                     consume_food_at( c.loc ) ) {
                     plan.clear();
+                    failed.clear();
                     return need_result::satisfied;
                 }
             }
-        } else if( low_danger && move_to_and_verify( target_bub ) ) {
+        } else if( low_danger && move_to_and_verify( target_bub, true ) ) {
             plan.last_result = need_result::progressed;
             plan.no_progress_turns = 0;
             return need_result::progressed;
@@ -6642,7 +6662,7 @@ npc::need_result npc::execute_eat_food()
                 plan.no_progress_turns = 0;
                 return need_result::progressed;
             }
-        } else if( low_danger && move_to_and_verify( target_bub ) ) {
+        } else if( low_danger && move_to_and_verify( target_bub, true ) ) {
             plan.last_result = need_result::progressed;
             plan.no_progress_turns = 0;
             return need_result::progressed;
@@ -6658,6 +6678,7 @@ npc::need_result npc::execute_eat_food()
     }
     plan.no_progress_turns++;
     if( plan.no_progress_turns >= 5 ) {
+        failed.insert( plan.target );
         plan.clear();
         plan.last_result = need_result::impossible;
         return need_result::impossible;
@@ -6672,16 +6693,19 @@ npc::need_result npc::execute_drink_water()
     const consume_filter cf = consume_filter::drink_only;
 
     need_plan &plan = ai_cache.water_plan;
+    std::set<tripoint_abs_ms> &failed = ai_cache.water_failed_targets;
     map &here = get_map();
 
     // 1. Try camp water, inventory drinks, adjacent ground drinks,
     //    then adjacent water terrain sources.
     if( consume_food_from_camp( cf ) ) {
         plan.clear();
+        failed.clear();
         return need_result::satisfied;
     }
     if( consume_food( cf ) ) {
         plan.clear();
+        failed.clear();
         return need_result::satisfied;
     }
     {
@@ -6690,6 +6714,7 @@ npc::need_result npc::execute_drink_water()
             if( square_dist( pos_bub(), c.loc.pos_bub( water_map ) ) <= 1 ) {
                 if( consume_food_at( c.loc ) ) {
                     plan.clear();
+                    failed.clear();
                     return need_result::satisfied;
                 }
             }
@@ -6699,6 +6724,7 @@ npc::need_result npc::execute_drink_water()
         if( square_dist( pos_bub(), ws.pos ) <= 1 ) {
             if( drink_from_water_source( ws.pos ) ) {
                 plan.clear();
+                failed.clear();
                 return need_result::satisfied;
             }
         }
@@ -6722,14 +6748,24 @@ npc::need_result npc::execute_drink_water()
         }
     }
 
-    // 3. Acquire target from scored candidates (ground drinks sorted by
-    //    rate_food, then water terrain by distance).
+    // 3. Acquire target from scored candidates, skipping any that
+    //    previously hit the no-progress timeout.
     if( !plan.active() && !candidates.empty() ) {
-        plan.goal = "drink_water";
-        plan.source_kind = candidates.front().source_kind;
-        plan.target = candidates.front().target;
-        plan.last_result = need_result::idle;
-        plan.no_progress_turns = 0;
+        for( const need_candidate &c : candidates ) {
+            if( failed.count( c.target ) == 0 ) {
+                plan.goal = "drink_water";
+                plan.source_kind = c.source_kind;
+                plan.target = c.target;
+                plan.last_result = need_result::idle;
+                plan.no_progress_turns = 0;
+                break;
+            }
+        }
+        if( !plan.active() ) {
+            // All candidates exhausted this generation. Clear the
+            // blacklist so the next attempt retries everything fresh.
+            failed.clear();
+        }
     }
     if( !plan.active() ) {
         plan.clear();
@@ -6746,10 +6782,11 @@ npc::need_result npc::execute_drink_water()
                 if( here.get_abs( c.loc.pos_bub( here ) ) == plan.target &&
                     consume_food_at( c.loc ) ) {
                     plan.clear();
+                    failed.clear();
                     return need_result::satisfied;
                 }
             }
-        } else if( low_danger && move_to_and_verify( target_bub ) ) {
+        } else if( low_danger && move_to_and_verify( target_bub, true ) ) {
             plan.last_result = need_result::progressed;
             plan.no_progress_turns = 0;
             return need_result::progressed;
@@ -6758,9 +6795,10 @@ npc::need_result npc::execute_drink_water()
         if( square_dist( pos_bub(), target_bub ) <= 1 ) {
             if( drink_from_water_source( target_bub ) ) {
                 plan.clear();
+                failed.clear();
                 return need_result::satisfied;
             }
-        } else if( low_danger && move_to_and_verify( target_bub ) ) {
+        } else if( low_danger && move_to_and_verify( target_bub, true ) ) {
             plan.last_result = need_result::progressed;
             plan.no_progress_turns = 0;
             return need_result::progressed;
@@ -6774,6 +6812,7 @@ npc::need_result npc::execute_drink_water()
     }
     plan.no_progress_turns++;
     if( plan.no_progress_turns >= 5 ) {
+        failed.insert( plan.target );
         plan.clear();
         plan.last_result = need_result::impossible;
         return need_result::impossible;

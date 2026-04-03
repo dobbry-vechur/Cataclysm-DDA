@@ -587,6 +587,12 @@ struct npc_short_term_cache {
     };
     need_plan food_plan;
     need_plan water_plan;
+    // Targets that hit the no-progress timeout. Managed explicitly by
+    // the executor (populated on timeout, cleared on satisfaction or
+    // goal change). Separate from need_plan so plan.clear() does not
+    // interact with failure history.
+    std::set<tripoint_abs_ms> food_failed_targets;
+    std::set<tripoint_abs_ms> water_failed_targets;
 
     // Filter for consume_food / find_nearby_food / consume_food_from_camp.
     enum class consume_filter : int { any, food_only, drink_only };
@@ -1222,7 +1228,7 @@ class npc : public Character
         bool drink_from_water_source( const tripoint_bub_ms &water_pos );
         bool consume_food_at( item_location loc );
         bool wear_item_at( item_location loc );
-        bool move_to_and_verify( const tripoint_bub_ms &target );
+        bool move_to_and_verify( const tripoint_bub_ms &target, bool no_bashing = false );
         npc_action address_player();
         npc_action long_term_goal_action();
         int evaluate_sleep_spot( tripoint_bub_ms p );
