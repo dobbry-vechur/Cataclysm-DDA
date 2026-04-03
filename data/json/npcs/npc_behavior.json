@@ -126,13 +126,25 @@
     "id": "npc_hunger",
     "strategy": "sequential",
     "conditions": [ { "predicate": "npc_needs_food_badly" } ],
-    "children": [ "npc_eat_food" ],
+    "children": [ "npc_obtain_food" ],
     "score": "npc_hunger_urgency"
+  },
+  {
+    "type": "behavior",
+    "id": "npc_obtain_food",
+    "strategy": "fallback",
+    "children": [ "npc_eat_food", "npc_forage_food" ]
   },
   {
     "type": "behavior",
     "id": "npc_eat_food",
     "conditions": [ { "predicate": "npc_has_food" } ],
+    "goal": "eat_food"
+  },
+  {
+    "type": "behavior",
+    "id": "npc_forage_food",
+    "conditions": [ { "predicate": "npc_can_obtain_food" } ],
     "goal": "eat_food"
   },
   {

@@ -56,6 +56,7 @@
 #include "game_constants.h"
 #include "gates.h"
 #include "gun_mode.h"
+#include "harvest.h"
 #include "iexamine.h"
 #include "inventory.h"
 #include "item.h"
@@ -118,6 +119,8 @@ enum class side : int;
 
 static const activity_id ACT_CRAFT( "ACT_CRAFT" );
 static const activity_id ACT_FIRSTAID( "ACT_FIRSTAID" );
+static const activity_id ACT_FORAGE( "ACT_FORAGE" );
+static const activity_id ACT_HARVEST( "ACT_HARVEST" );
 static const activity_id ACT_MOVE_LOOT( "ACT_MOVE_LOOT" );
 static const activity_id ACT_MULTIPLE_BUTCHER( "ACT_MULTIPLE_BUTCHER" );
 static const activity_id ACT_MULTIPLE_CHOP_PLANKS( "ACT_MULTIPLE_CHOP_PLANKS" );
@@ -1518,8 +1521,11 @@ void npc::move()
         set_attitude( NPCATT_NULL );
     }
     regen_ai_cache();
-    // NPCs under operation or casting spells should just stay still
-    if( activity.id() == ACT_OPERATION || activity.id() == ACT_SPELLCASTING ) {
+    // NPCs with in-progress activities should finish them before re-evaluating.
+    // Without this, the BT re-runs every turn, address_needs re-assigns the
+    // same activity, and the old copy floods the backlog.
+    if( activity.id() == ACT_OPERATION || activity.id() == ACT_SPELLCASTING ||
+        activity.id() == ACT_FORAGE || activity.id() == ACT_HARVEST ) {
         execute_action( npc_player_activity );
         return;
     }
@@ -1711,6 +1717,17 @@ void npc::move()
                     if( !completed_goal ) {
                         completed_goal = ( new_goal != "goto_ordered_position" );
                     }
+                } else if( committed == "eat_food" ) {
+                    behavior::character_oracle_t oracle( this );
+                    completed_goal =
+                        oracle.needs_food_badly( "" ) != behavior::status_t::running ||
+                        ( oracle.has_food( "" ) != behavior::status_t::running &&
+                          oracle.can_obtain_food( "" ) != behavior::status_t::running );
+                } else if( committed == "drink_water" ) {
+                    behavior::character_oracle_t oracle( this );
+                    completed_goal =
+                        oracle.needs_water_badly( "" ) != behavior::status_t::running ||
+                        oracle.has_water( "" ) != behavior::status_t::running;
                 } else if( committed == "camp_work" ) {
                     completed_goal = ( new_goal != "camp_work" );
                 } else if( committed == "return_to_camp" ) {
@@ -2838,6 +2855,18 @@ healing_options npc::patient_assessment( const Character &c )
 
 npc_action npc::address_needs( float danger )
 {
+    // Activities assigned here are self-initiated (the NPC addressing its own
+    // needs), not player-assigned tasks. assign_activity() unconditionally sets
+    // NPCATT_ACTIVITY, which causes "completed the assigned task" spam and
+    // disrupts the BT. Save and restore around any activity we pick up.
+    const npc_attitude saved_attitude = attitude;
+    const npc_mission saved_mission = mission;
+    const auto self_activity = [&]() -> npc_action {
+        attitude = saved_attitude;
+        mission = saved_mission;
+        return npc_player_activity;
+    };
+
     // Check if NPC needs warmth via the oracle predicate directly.
     // The full BT subtree is too narrow for gating -- it only knows about
     // inventory items and indoor tiles, not ground items. The predicate
@@ -3014,10 +3043,10 @@ npc_action npc::address_needs( float danger )
             }
         }
         // Last resort: harvest scavenging (forage underbrush, harvest plants).
-        for( const scored_water_source &h : find_nearby_harvestable() ) {
+        for( const scored_water_source &h : find_nearby_harvestable( true ) ) {
             if( square_dist( pos_bub(), h.pos ) <= 1 ) {
                 here.examine( *this, h.pos );
-                return npc_noop;
+                return activity ? self_activity() : npc_noop;
             } else if( move_to_and_verify( h.pos ) ) {
                 return npc_noop;
             }
@@ -3057,10 +3086,10 @@ npc_action npc::address_needs( float danger )
             }
         }
         // Last resort: harvest scavenging (same as extreme path).
-        for( const scored_water_source &h : find_nearby_harvestable() ) {
+        for( const scored_water_source &h : find_nearby_harvestable( true ) ) {
             if( square_dist( pos_bub(), h.pos ) <= 1 ) {
                 here.examine( *this, h.pos );
-                return npc_noop;
+                return activity ? self_activity() : npc_noop;
             } else if( move_to_and_verify( h.pos ) ) {
                 return npc_noop;
             }
@@ -3075,7 +3104,7 @@ npc_action npc::address_needs( float danger )
         if( !activity ) {
             assign_activity( pulp_activity_actor( *pulp_location ) );
         }
-        return npc_player_activity;
+        return self_activity();
     } else if( find_corpse_to_pulp() ) {
         move_to_next();
         return npc_noop;
@@ -4618,7 +4647,7 @@ bool npc::do_player_activity()
             backlog.pop_front();
             current_activity_id = activity.id();
         } else {
-            if( is_player_ally() ) {
+            if( is_player_ally() && attitude == NPCATT_ACTIVITY ) {
                 add_msg( m_info, string_format( _( "%s completed the assigned task." ), disp_name() ) );
             }
             current_activity_id = activity_id::NULL_ID();
@@ -5200,6 +5229,11 @@ bool npc::consume_food()
     item_location best_food;
     bool consumed = false;
     int want_hunger = std::max( 0, get_hunger() );
+    // When calorically starving but not short-term hungry (just ate but still
+    // underweight), force a minimum hunger signal so rate_food scores food > 0.
+    if( want_hunger == 0 && has_calorie_deficit() ) {
+        want_hunger = 100;
+    }
     int want_quench = std::max( 0, get_thirst() );
 
     const std::vector<item_location> inv_food = cache_get_items_with( "is_food", &item::is_food );
@@ -6062,7 +6096,10 @@ std::vector<npc::scored_item> npc::find_nearby_food()
     if( is_player_ally() && !rules.has_flag( ally_rule::allow_pick_up ) ) {
         return results;
     }
-    const int want_hunger = std::max( 0, get_hunger() );
+    int want_hunger = std::max( 0, get_hunger() );
+    if( want_hunger == 0 && has_calorie_deficit() ) {
+        want_hunger = 100;
+    }
     const int want_quench = std::max( 0, get_thirst() );
     map &here = get_map();
 
@@ -6300,7 +6337,27 @@ std::vector<npc::scored_shelter> npc::find_nearby_shelters() const
     return results;
 }
 
-std::vector<npc::scored_water_source> npc::find_nearby_harvestable() const
+// Check whether a harvest at a position yields food (has caloric or food-category drops).
+static bool harvest_yields_food( const map &here, const tripoint_bub_ms &p )
+{
+    if( here.ter( p ).obj().has_examine( iexamine::shrub_wildveggies ) ) {
+        return true;
+    }
+    const harvest_id &harvest = here.get_harvest( p );
+    if( harvest.is_null() || harvest->empty() ) {
+        return false;
+    }
+    for( const auto &entry : harvest->entries() ) {
+        const itype *drop_type = item::find_type( itype_id( entry.drop ) );
+        if( drop_type && ( ( drop_type->comestible && drop_type->comestible->has_calories() ) ||
+                           drop_type->category_force == item_category_id( "food" ) ) ) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::vector<npc::scored_water_source> npc::find_nearby_harvestable( bool food_only ) const
 {
     std::vector<scored_water_source> results;
     const map &here = get_map();
@@ -6313,6 +6370,9 @@ std::vector<npc::scored_water_source> npc::find_nearby_harvestable() const
         const bool harvestable = here.is_harvestable( p ) ||
                                  here.ter( p ).obj().has_examine( iexamine::shrub_wildveggies );
         if( !harvestable ) {
+            continue;
+        }
+        if( food_only && !harvest_yields_food( here, p ) ) {
             continue;
         }
         if( !sees( here, p ) ) {

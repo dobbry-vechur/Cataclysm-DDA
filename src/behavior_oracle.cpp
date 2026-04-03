@@ -46,6 +46,7 @@ predicate_map = {{
         { "npc_can_take_shelter", make_function( &character_oracle_t::can_take_shelter ) },
         { "npc_has_water", make_function( &character_oracle_t::has_water ) },
         { "npc_has_food", make_function( &character_oracle_t::has_food ) },
+        { "npc_can_obtain_food", make_function( &character_oracle_t::can_obtain_food ) },
         { "npc_needs_sleep_badly", make_function( &character_oracle_t::needs_sleep_badly ) },
         { "npc_can_sleep", make_function( &character_oracle_t::can_sleep ) },
         { "npc_in_danger", make_function( &character_oracle_t::in_danger ) },

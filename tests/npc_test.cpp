@@ -82,6 +82,7 @@ static const efftype_id effect_bouldering( "bouldering" );
 static const efftype_id effect_catch_up( "catch_up" );
 static const efftype_id effect_lying_down( "lying_down" );
 static const efftype_id effect_meth( "meth" );
+static const efftype_id effect_npc_suspend( "npc_suspend" );
 static const efftype_id effect_sleep( "sleep" );
 static const efftype_id effect_wet( "wet" );
 
@@ -129,6 +130,11 @@ static const ter_str_id ter_t_door_c( "t_door_c" );
 static const ter_str_id ter_t_floor( "t_floor" );
 static const ter_str_id ter_t_ponywall( "t_ponywall" );
 static const ter_str_id ter_t_swater_sh( "t_swater_sh" );
+static const ter_str_id ter_t_tree_apple( "t_tree_apple" );
+static const ter_str_id ter_t_tree_birch( "t_tree_birch" );
+static const ter_str_id ter_t_tree_dead( "t_tree_dead" );
+static const ter_str_id ter_t_tree_pine( "t_tree_pine" );
+static const ter_str_id ter_t_tree_walnut( "t_tree_walnut" );
 static const ter_str_id ter_t_underbrush( "t_underbrush" );
 static const ter_str_id ter_t_wall( "t_wall" );
 static const ter_str_id ter_t_wall_glass( "t_wall_glass" );
@@ -2459,7 +2465,7 @@ TEST_CASE( "npc_harvest_scavenging", "[npc][needs]" )
 
         guy.address_needs( 0 );
 
-        REQUIRE( guy.has_activity() );
+        REQUIRE( guy.activity );
         CHECK( guy.activity.id() == ACT_FORAGE );
         CHECK( guy.activity.placement == here.get_abs( adj ) );
     }
@@ -4370,5 +4376,269 @@ TEST_CASE( "on_load_migrates_legacy_camp_npcs", "[npc][camp]" )
         guy.set_guard_pos( guy.pos_abs() );
         guy.on_load( &here );
         CHECK( guy.mission == NPC_MISSION_GUARD_ALLY );
+    }
+}
+
+// NPC infinite loop when trying to forage/harvest terrain it can't interact with.
+TEST_CASE( "npc_no_infinite_loop_foraging", "[npc][needs][forage]" )
+{
+    clear_map_without_vision();
+    clear_avatar();
+    get_player_character().camps.clear();
+    get_player_character().setpos( get_map(), tripoint_bub_ms{ 10, 10, 0 } );
+    get_weather().forced_temperature = 20_C;
+
+    npc &guy = spawn_npc( { 50, 50 }, "test_talker" );
+    clear_character( guy, true );
+
+    // Extreme hunger bypasses the one_in(3) gate, deterministically tries to forage.
+    guy.set_hunger( 300 );
+    guy.set_thirst( 100 );
+    guy.set_stored_kcal( 1000 );
+
+    map &here = get_map();
+    const tripoint_bub_ms adj = guy.pos_bub() + point::east;
+
+    // Helper: run the NPC turn loop from do_turn.cpp, return true if it loops.
+    const auto npc_loops = [&]() {
+        guy.set_moves( 100 );
+        int turns = 0;
+        int real_count = 0;
+        const int count_limit = std::max( 10, guy.get_moves() / 64 );
+        while( !guy.is_dead() && !guy.in_sleep_state() &&
+               guy.get_moves() > 0 && turns < 10 ) {
+            const int moves = guy.get_moves();
+            guy.move();
+            if( moves == guy.get_moves() ) {
+                real_count++;
+                if( real_count > count_limit ) {
+                    turns++;
+                }
+            }
+        }
+        return turns >= 10;
+    };
+
+    SECTION( "underbrush with items on it" ) {
+        set_time_to_day();
+        here.ter_set( adj, ter_t_underbrush );
+        here.add_item_or_charges( adj, item( itype_2x4 ) );
+        here.build_map_cache( 0 );
+
+        CHECK_FALSE( npc_loops() );
+        CHECK_FALSE( guy.has_effect( effect_npc_suspend ) );
+    }
+
+    SECTION( "harvestable tree - query_pick rejects non-avatar" ) {
+        // Autumn so the apple tree has a harvest entry.
+        calendar::turn = calendar::turn_zero + 2 * calendar::season_length() + 12_hours;
+        here.ter_set( adj, ter_t_tree_apple );
+        here.build_map_cache( 0 );
+        REQUIRE( here.is_harvestable( adj ) );
+
+        CHECK_FALSE( npc_loops() );
+        CHECK_FALSE( guy.has_effect( effect_npc_suspend ) );
+    }
+
+    SECTION( "forage activity completes without backlog flooding" ) {
+        set_time_to_day();
+        here.ter_set( adj, ter_t_underbrush );
+        here.build_map_cache( 0 );
+
+        // Run several game turns. Each turn the BT may try to override the
+        // forage activity with follow_player. The activity should complete
+        // without endlessly re-assigning and flooding the backlog.
+        for( int turn = 0; turn < 20; ++turn ) {
+            guy.set_moves( 100 );
+            guy.move();
+        }
+        CHECK( guy.backlog.size() < 10 );
+    }
+}
+
+// BT should commit to eat_food when the NPC has a caloric deficit and food
+// is obtainable nearby, even when short-term hunger is low.
+TEST_CASE( "npc_bt_commits_to_food_when_starving", "[npc][needs][forage]" )
+{
+    clear_map_without_vision();
+    clear_avatar();
+    get_player_character().camps.clear();
+    get_player_character().setpos( get_map(), tripoint_bub_ms{ 10, 10, 0 } );
+    get_weather().forced_temperature = 20_C;
+    set_time_to_day();
+
+    npc &guy = spawn_npc( { 50, 50 }, "test_talker" );
+    clear_character( guy, true );
+
+    // Follower NPC so the BT considers follow_player.
+    guy.set_fac( faction_your_followers );
+    guy.set_attitude( NPCATT_FOLLOW );
+    REQUIRE( guy.is_player_ally() );
+
+    // Caloric deficit but NOT short-term hungry (reproduces the save scenario).
+    guy.set_stored_kcal( 1000 );
+    guy.set_hunger( -1 );
+    guy.set_thirst( 0 );
+
+    map &here = get_map();
+    const tripoint_bub_ms adj = guy.pos_bub() + point::east;
+    here.ter_set( adj, ter_t_underbrush );
+    here.build_map_cache( 0 );
+
+    // Run several turns. The NPC should commit to eating (forage) and not
+    // oscillate between eat_food and follow_player every other turn.
+    int forage_turns = 0;
+    int follow_turns = 0;
+    for( int turn = 0; turn < 10; ++turn ) {
+        guy.set_moves( 100 );
+        guy.move();
+        if( guy.activity.id() == ACT_FORAGE ) {
+            forage_turns++;
+        }
+        const std::string &goal = guy.get_committed_goal();
+        if( goal == "follow_player" ) {
+            follow_turns++;
+        }
+    }
+
+    // NPC should spend most turns foraging, not following.
+    CHECK( forage_turns > follow_turns );
+}
+
+// When an NPC is committed to eat_food but all nearby food sources are gone,
+// the commitment should clear so other goals (follow, goto) can proceed.
+TEST_CASE( "npc_eat_food_commitment_clears_when_unobtainable", "[npc][needs][forage]" )
+{
+    clear_map_without_vision();
+    clear_avatar();
+    get_player_character().camps.clear();
+    get_player_character().setpos( get_map(), tripoint_bub_ms{ 10, 10, 0 } );
+    get_weather().forced_temperature = 20_C;
+    set_time_to_day();
+
+    npc &guy = spawn_npc( { 50, 50 }, "test_talker" );
+    clear_character( guy, true );
+    guy.set_fac( faction_your_followers );
+    guy.set_attitude( NPCATT_FOLLOW );
+
+    // Caloric deficit but no food anywhere.
+    guy.set_stored_kcal( 1000 );
+    guy.set_hunger( -1 );
+    guy.set_thirst( 0 );
+
+    map &here = get_map();
+    here.build_map_cache( 0 );
+
+    // Force commitment to eat_food.
+    guy.set_committed_goal( "eat_food" );
+
+    // Run a few turns. With no food obtainable, the commitment should clear
+    // and the NPC should fall through to another goal (follow, etc.).
+    for( int turn = 0; turn < 5; ++turn ) {
+        guy.set_moves( 100 );
+        guy.move();
+    }
+    CHECK( guy.get_committed_goal() != "eat_food" );
+}
+
+// Starving NPCs should eat foraged food immediately instead of dropping it.
+TEST_CASE( "npc_eats_foraged_food_immediately", "[npc][needs][forage]" )
+{
+    clear_map_without_vision();
+    clear_avatar();
+    get_player_character().camps.clear();
+    get_player_character().setpos( get_map(), tripoint_bub_ms{ 50, 52, 0 } );
+    get_weather().forced_temperature = 20_C;
+    set_time_to_day();
+
+    npc &guy = spawn_npc( { 50, 50 }, "test_talker" );
+    clear_character( guy, true );
+    guy.set_fac( faction_your_followers );
+    guy.set_attitude( NPCATT_FOLLOW );
+    guy.rules.clear_flag( ally_rule::allow_pick_up );
+    guy.set_stored_kcal( 1000 );
+    guy.set_hunger( -1 );
+    guy.set_thirst( 0 );
+    REQUIRE( guy.has_calorie_deficit() );
+
+    // Apple tree in autumn: always drops 2-5 apples, no RNG gating.
+    calendar::turn = calendar::turn_zero + 2 * calendar::season_length() + 12_hours;
+    map &here = get_map();
+    const tripoint_bub_ms adj = guy.pos_bub() + point::east;
+    here.ter_set( adj, ter_t_tree_apple );
+    here.build_map_cache( 0 );
+    REQUIRE( here.is_harvestable( adj ) );
+    REQUIRE_FALSE( guy.find_nearby_harvestable( true ).empty() );
+
+    // Run enough turns for the harvest activity to complete.
+    const int kcal_before = guy.get_stored_kcal();
+    for( int turn = 0; turn < 40; ++turn ) {
+        guy.set_moves( 100 );
+        guy.move();
+    }
+
+    // The NPC should have consumed at least some harvested food.
+    CHECK( guy.get_stored_kcal() + guy.stomach.get_calories() > kcal_before );
+}
+
+// can_obtain_food should distinguish food-yielding terrain from non-food.
+TEST_CASE( "npc_can_obtain_food_filters_harvests", "[npc][needs][forage]" )
+{
+    clear_map_without_vision();
+    set_time_to_day();
+    calendar::turn = calendar::turn_zero + 2 * calendar::season_length() + 12_hours;
+
+    npc &guy = spawn_npc( { 50, 50 }, "test_talker" );
+    clear_character( guy, true );
+    guy.set_stored_kcal( 1000 );
+
+    map &here = get_map();
+    const tripoint_bub_ms adj = guy.pos_bub() + point::east;
+    behavior::character_oracle_t oracle( &guy );
+
+    SECTION( "underbrush yields seasonal food" ) {
+        here.ter_set( adj, ter_t_underbrush );
+        here.build_map_cache( 0 );
+        CHECK( oracle.can_obtain_food( "" ) == behavior::status_t::running );
+    }
+
+    SECTION( "apple tree in autumn yields food" ) {
+        here.ter_set( adj, ter_t_tree_apple );
+        here.build_map_cache( 0 );
+        REQUIRE( here.is_harvestable( adj ) );
+        CHECK( oracle.can_obtain_food( "" ) == behavior::status_t::running );
+    }
+
+    SECTION( "walnut tree in autumn yields food" ) {
+        here.ter_set( adj, ter_t_tree_walnut );
+        here.build_map_cache( 0 );
+        REQUIRE( here.is_harvestable( adj ) );
+        CHECK( oracle.can_obtain_food( "" ) == behavior::status_t::running );
+    }
+
+    SECTION( "dead tree (sticks only) is not food" ) {
+        here.ter_set( adj, ter_t_tree_dead );
+        here.build_map_cache( 0 );
+        REQUIRE( here.is_harvestable( adj ) );
+        CHECK( oracle.can_obtain_food( "" ) == behavior::status_t::failure );
+    }
+
+    SECTION( "birch tree (bark only) is not food" ) {
+        here.ter_set( adj, ter_t_tree_birch );
+        here.build_map_cache( 0 );
+        REQUIRE( here.is_harvestable( adj ) );
+        CHECK( oracle.can_obtain_food( "" ) == behavior::status_t::failure );
+    }
+
+    SECTION( "pine tree (boughs/resin) is not food" ) {
+        here.ter_set( adj, ter_t_tree_pine );
+        here.build_map_cache( 0 );
+        REQUIRE( here.is_harvestable( adj ) );
+        CHECK( oracle.can_obtain_food( "" ) == behavior::status_t::failure );
+    }
+
+    SECTION( "no harvestable terrain nearby" ) {
+        here.build_map_cache( 0 );
+        CHECK( oracle.can_obtain_food( "" ) == behavior::status_t::failure );
     }
 }

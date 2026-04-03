@@ -56,8 +56,13 @@ status_t character_oracle_t::needs_water_badly( std::string_view ) const
 
 status_t character_oracle_t::needs_food_badly( std::string_view ) const
 {
-    // Check hunger threshold.
+    // Short-term: stomach empty and actively starving.
     if( subject->get_hunger() >= 300 && subject->get_starvation() > base_metabolic_rate ) {
+        return status_t::running;
+    }
+    // Long-term: severe caloric deficit (same threshold as address_needs extreme path).
+    if( subject->get_stored_kcal() + subject->stomach.get_calories() <
+        subject->get_healthy_kcal() * 3 / 4 ) {
         return status_t::running;
     }
     return status_t::success;
@@ -123,6 +128,15 @@ status_t character_oracle_t::has_food( std::string_view ) const
         return cand.is_food() && cand.get_comestible()->has_calories();
     } );
     return found_food ? status_t::running : status_t::failure;
+}
+
+status_t character_oracle_t::can_obtain_food( std::string_view ) const
+{
+    const npc *n = dynamic_cast<const npc *>( subject );
+    if( !n ) {
+        return status_t::failure;
+    }
+    return n->find_nearby_harvestable( true ).empty() ? status_t::failure : status_t::running;
 }
 
 status_t character_oracle_t::needs_sleep_badly( std::string_view ) const

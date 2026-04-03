@@ -2287,13 +2287,19 @@ void iexamine_helper::handle_harvest( Character &you, const itype_id &itemid, bo
     if( harvest.has_temperature() ) {
         harvest.set_item_temperature( get_weather().get_temperature( you.pos_bub() ) );
     }
-    if( !force_drop && you.can_pickVolume( harvest, true ) &&
-        you.can_pickWeight( harvest, !get_option<bool>( "DANGEROUS_PICKUPS" ) ) ) {
+    if( you.is_npc() && harvest.is_food() &&
+        ( you.get_hunger() > 0 || you.has_calorie_deficit() ) &&
+        you.will_eat( harvest ).success() ) {
+        you.consume( harvest );
+    } else if( !force_drop && you.can_pickVolume( harvest, true ) &&
+               you.can_pickWeight( harvest, !get_option<bool>( "DANGEROUS_PICKUPS" ) ) ) {
         you.i_add( harvest );
         you.add_msg_if_player( _( "You harvest: %s." ), harvest.tname() );
+        you.add_msg_if_npc( _( "<npcname> harvests: %s." ), harvest.tname() );
     } else {
         get_map().add_item_or_charges( you.pos_bub(), harvest );
         you.add_msg_if_player( _( "You harvest and drop: %s." ), harvest.tname() );
+        you.add_msg_if_npc( _( "<npcname> harvests and drops: %s." ), harvest.tname() );
     }
 }
 
@@ -2429,7 +2435,8 @@ void iexamine::flower_dahlia( Character &you, const tripoint_bub_ms &examp )
 static bool query_pick( Character &who, const tripoint_bub_ms &target )
 {
     if( !who.is_avatar() ) {
-        return false;
+        // NPCs already decided to harvest via address_needs.
+        return true;
     }
 
     map &here = get_map();
@@ -4626,8 +4633,10 @@ void iexamine::tree_marloss( Character &you, const tripoint_bub_ms &examp )
 void iexamine::shrub_wildveggies( Character &you, const tripoint_bub_ms &examp )
 {
     map &here = get_map();
-    // Ask if there's something possibly more interesting than this shrub here
-    if( ( !here.i_at( examp ).empty() ||
+    // Ask if there's something possibly more interesting than this shrub here.
+    // NPCs skip the prompt - they already decided to forage via address_needs.
+    if( !you.is_npc() &&
+        ( !here.i_at( examp ).empty() ||
           here.veh_at( examp ) ||
           here.can_see_trap_at( examp, you ) ||
           get_creature_tracker().creature_at( examp ) != nullptr ) &&
@@ -4636,7 +4645,8 @@ void iexamine::shrub_wildveggies( Character &you, const tripoint_bub_ms &examp )
         return;
     }
 
-    add_msg( _( "You forage through the %s." ), here.tername( examp ) );
+    you.add_msg_if_player( _( "You forage through the %s." ), here.tername( examp ) );
+    you.add_msg_if_npc( _( "<npcname> forages through the %s." ), here.tername( examp ) );
     ///\EFFECT_SURVIVAL speeds up foraging
     int move_cost = 100000 / ( 2 * you.get_skill_level( skill_survival ) + 5 );
     ///\EFFECT_PER randomly speeds up foraging
