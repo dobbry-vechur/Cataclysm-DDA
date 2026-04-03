@@ -556,6 +556,37 @@ struct npc_short_term_cache {
     // BT goal commitment: persists across turns until completed or
     // overridden by a higher-priority goal. Empty = no commitment.
     std::string committed_goal;
+
+    // Result of the last execute_need_goal call.
+    enum class need_result : int {
+        idle,        // no plan active
+        progressed,  // moved toward target or started activity
+        satisfied,   // need fulfilled (ate, drank, etc.)
+        blocked,     // transient failure, worth retrying
+        deferred,    // blocked by policy (danger), don't count as no-progress
+        impossible   // target gone or unreachable, clear/retarget
+    };
+
+    // Per-goal executor state. Tracks a concrete target so the executor
+    // does not rescan and dither every turn.
+    enum class food_source : int { none, ground_item, harvestable };
+
+    struct need_plan {
+        std::string goal;
+        food_source source_kind = food_source::none;
+        tripoint_abs_ms target;
+        need_result last_result = need_result::idle;
+        int no_progress_turns = 0;
+
+        bool active() const {
+            return !goal.empty();
+        }
+        void clear() {
+            *this = need_plan{};
+        }
+    };
+    need_plan food_plan;
+
     // Cache of locations the NPC has searched recently in npc::find_item()
     lru_cache<tripoint_abs_ms, int> searched_tiles;
     // returns the value of the distance between a friendly creature and the closest enemy to that
@@ -1284,7 +1315,7 @@ class npc : public Character
         bool saw_player_recently() const;
         /** Returns true if food was consumed, false otherwise. */
         bool consume_food();
-        bool consume_food_from_camp();
+        bool consume_food_from_camp( bool food_only = false );
         int get_thirst() const override;
 
         // Movement on the overmap scale
@@ -1389,6 +1420,9 @@ class npc : public Character
         float get_ai_danger() const {
             return ai_cache.danger;
         }
+        void set_ai_danger( float d ) {
+            ai_cache.danger = d;
+        }
         weak_ptr_fast<Creature> get_ai_target() const {
             return ai_cache.target;
         }
@@ -1403,6 +1437,14 @@ class npc : public Character
         }
         void set_committed_goal( const std::string &goal ) {
             ai_cache.committed_goal = goal;
+        }
+        using need_result = npc_short_term_cache::need_result;
+        using need_plan = npc_short_term_cache::need_plan;
+        // Execute the concrete action for a needs-category goal.
+        // Owns target selection and progress tracking.
+        need_result execute_need_goal( const std::string &goal );
+        const need_plan &get_food_plan() const {
+            return ai_cache.food_plan;
         }
         // Persistent duty post from mission/dialogue assignment.
         // Used by BT duty predicates. Does NOT include ephemeral

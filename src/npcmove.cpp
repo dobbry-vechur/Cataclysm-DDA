@@ -1681,6 +1681,11 @@ void npc::move()
         // until completed or overridden by a higher-priority category
         // (combat > investigation > needs > follow > duty > idle).
         {
+            // Save for self-initiated activities that should not change
+            // the NPC's attitude/mission (see self_activity in address_needs).
+            const npc_attitude saved_att = attitude;
+            const npc_mission saved_mis = mission;
+
             behavior::character_oracle_t oracle( this );
             behavior::tree decision_tree;
             decision_tree.add( &behavior_node_t_npc_decision.obj() );
@@ -1719,10 +1724,13 @@ void npc::move()
                     }
                 } else if( committed == "eat_food" ) {
                     behavior::character_oracle_t oracle( this );
-                    completed_goal =
-                        oracle.needs_food_badly( "" ) != behavior::status_t::running ||
-                        ( oracle.has_food( "" ) != behavior::status_t::running &&
-                          oracle.can_obtain_food( "" ) != behavior::status_t::running );
+                    bool satisfied = oracle.needs_food_badly( "" ) != behavior::status_t::running;
+                    bool exec_impossible = ai_cache.food_plan.last_result ==
+                                           need_result::impossible;
+                    completed_goal = satisfied || exec_impossible;
+                    if( completed_goal ) {
+                        ai_cache.food_plan.clear();
+                    }
                 } else if( committed == "drink_water" ) {
                     behavior::character_oracle_t oracle( this );
                     completed_goal =
@@ -1742,6 +1750,10 @@ void npc::move()
                     decision_category new_cat = bt_goal_to_category( new_goal );
                     decision_category old_cat = bt_goal_to_category( committed );
                     if( new_cat < old_cat ) {
+                        // Clear stale plan when overridden by higher priority.
+                        if( committed == "eat_food" ) {
+                            ai_cache.food_plan.clear();
+                        }
                         committed = new_goal;
                     } else {
                         new_goal = committed;
@@ -1795,9 +1807,43 @@ void npc::move()
                     // own fallback logic like lying_down on meth).
                     action = address_needs();
                 }
+            } else if( new_goal == "eat_food" ) {
+                const need_result result = execute_need_goal( new_goal );
+                if( result == need_result::progressed && activity ) {
+                    // Undo attitude/mission change from assign_activity.
+                    attitude = saved_att;
+                    mission = saved_mis;
+                    action = npc_player_activity;
+                } else if( result == need_result::progressed ) {
+                    action = npc_noop; // moved toward target, moves consumed
+                } else if( result == need_result::satisfied ) {
+                    action = npc_noop;
+                } else if( result == need_result::impossible ) {
+                    committed.clear();
+                    action = npc_undecided;
+                } else {
+                    // blocked: pause this turn, don't yield to follow/goto
+                    // which would pull the NPC away and cause oscillation
+                    action = npc_pause;
+                }
             } else {
-                // Needs goal (sleep, eat, drink, etc.). Full address_needs.
+                // Other needs (sleep, drink, warmth). Legacy address_needs.
                 action = address_needs();
+            }
+
+            // Debug: executor state for needs goals.
+            if( new_goal == "eat_food" ) {
+                const need_plan &fp = ai_cache.food_plan;
+                static const std::array<const char *, 6> result_names = {{
+                        "idle", "progressed", "satisfied", "blocked", "deferred", "impossible"
+                    }
+                };
+                add_msg_debug( debugmode::DF_NPC_NEEDS,
+                               "NPC %s: food_plan target=%s result=%s no_progress=%d",
+                               get_name(),
+                               fp.active() ? fp.target.to_string().c_str() : "none",
+                               result_names[static_cast<int>( fp.last_result )],
+                               fp.no_progress_turns );
             }
         }
         print_action( "address_needs %s", action );
@@ -5167,7 +5213,7 @@ static float rate_food( const Character &who, const item &it, int want_nutr,
     return weight;
 }
 
-bool npc::consume_food_from_camp()
+bool npc::consume_food_from_camp( bool food_only )
 {
     Character &player_character = get_player_character();
     std::optional<basecamp *> potential_bc;
@@ -5185,7 +5231,8 @@ bool npc::consume_food_from_camp()
     basecamp *bcp = *potential_bc;
 
     // Handle water -- route through stomach so thirst decreases naturally.
-    if( get_thirst() > 40 && bcp->has_water() && bcp->allowed_access_by( *this, true ) ) {
+    // Skipped when food_only is set (eat_food executor must not satisfy thirst).
+    if( !food_only && get_thirst() > 40 && bcp->has_water() && bcp->allowed_access_by( *this, true ) ) {
         const units::volume want = std::max( 0_ml,
                                              units::from_milliliter( get_thirst() * 5 ) );
         const units::volume room = stomach.stomach_remaining( *this );
@@ -6385,6 +6432,146 @@ std::vector<npc::scored_water_source> npc::find_nearby_harvestable( bool food_on
         return a.dist < b.dist;
     } );
     return results;
+}
+
+npc::need_result npc::execute_need_goal( const std::string &goal )
+{
+    if( goal != "eat_food" ) {
+        return need_result::idle;
+    }
+
+    // Mirror the legacy danger gate: non-adjacent food seeking is
+    // only safe at low danger (same threshold as address_needs).
+    const bool low_danger = ai_cache.danger <= NPC_DANGER_VERY_LOW;
+
+    need_plan &plan = ai_cache.food_plan;
+    map &here = get_map();
+
+    // 1. Try camp food (calories only, skip the water path),
+    //    inventory food, then adjacent ground food.
+    if( consume_food_from_camp( true ) ) {
+        plan.clear();
+        return need_result::satisfied;
+    }
+    if( consume_food() ) {
+        plan.clear();
+        return need_result::satisfied;
+    }
+    {
+        map &food_map = get_map();
+        for( scored_item &c : find_nearby_food() ) {
+            if( square_dist( pos_bub(), c.loc.pos_bub( food_map ) ) <= 1 ) {
+                if( consume_food_at( c.loc ) ) {
+                    plan.clear();
+                    return need_result::satisfied;
+                }
+            }
+        }
+    }
+
+    using food_source = npc_short_term_cache::food_source;
+
+    // 2. Validate existing target.
+    if( plan.active() ) {
+        const tripoint_bub_ms target_bub = here.get_bub( plan.target );
+        bool still_valid = false;
+        if( plan.source_kind == food_source::ground_item ) {
+            // Check ground items and vehicle cargo at the target tile.
+            still_valid = false;
+            for( const scored_item &c : find_nearby_food() ) {
+                if( here.get_abs( c.loc.pos_bub( here ) ) == plan.target ) {
+                    still_valid = true;
+                    break;
+                }
+            }
+        } else if( plan.source_kind == food_source::harvestable ) {
+            still_valid = here.is_harvestable( target_bub ) ||
+                          here.ter( target_bub ).obj().has_examine( iexamine::shrub_wildveggies );
+        }
+        if( !still_valid ) {
+            plan.clear();
+        }
+    }
+
+    // 3. Acquire target if we don't have one.
+    //    Priority: distant ground food first, then harvestable terrain.
+    if( !plan.active() ) {
+        // Ground food (same scan as address_needs extreme path).
+        for( const scored_item &c : find_nearby_food() ) {
+            plan.goal = goal;
+            plan.source_kind = food_source::ground_item;
+            plan.target = here.get_abs( c.loc.pos_bub( here ) );
+            plan.last_result = need_result::idle;
+            plan.no_progress_turns = 0;
+            break;
+        }
+    }
+    if( !plan.active() ) {
+        // Harvestable terrain (food-yielding only).
+        const auto sources = find_nearby_harvestable( true );
+        if( !sources.empty() ) {
+            plan.goal = goal;
+            plan.source_kind = food_source::harvestable;
+            plan.target = here.get_abs( sources.front().pos );
+            plan.last_result = need_result::idle;
+            plan.no_progress_turns = 0;
+        }
+    }
+    if( !plan.active() ) {
+        plan.clear();
+        plan.last_result = need_result::impossible;
+        return need_result::impossible;
+    }
+
+    // 4. Execute based on source kind.
+    const tripoint_bub_ms target_bub = here.get_bub( plan.target );
+
+    if( plan.source_kind == food_source::ground_item ) {
+        if( square_dist( pos_bub(), target_bub ) <= 1 ) {
+            // Try consuming from the same scan that find_nearby_food uses
+            // (covers both ground items and vehicle cargo).
+            for( scored_item &c : find_nearby_food() ) {
+                if( here.get_abs( c.loc.pos_bub( here ) ) == plan.target &&
+                    consume_food_at( c.loc ) ) {
+                    plan.clear();
+                    return need_result::satisfied;
+                }
+            }
+        } else if( low_danger && move_to_and_verify( target_bub ) ) {
+            plan.last_result = need_result::progressed;
+            plan.no_progress_turns = 0;
+            return need_result::progressed;
+        }
+    } else if( plan.source_kind == food_source::harvestable ) {
+        if( square_dist( pos_bub(), target_bub ) <= 1 ) {
+            here.examine( *this, target_bub );
+            if( activity ) {
+                plan.last_result = need_result::progressed;
+                plan.no_progress_turns = 0;
+                return need_result::progressed;
+            }
+        } else if( low_danger && move_to_and_verify( target_bub ) ) {
+            plan.last_result = need_result::progressed;
+            plan.no_progress_turns = 0;
+            return need_result::progressed;
+        }
+    }
+
+    // 5. No progress this turn.
+    // If the target is distant and danger blocked movement, that's a policy
+    // deferral, not an executor failure. Don't count toward no_progress_turns.
+    if( !low_danger && square_dist( pos_bub(), target_bub ) > 1 ) {
+        plan.last_result = need_result::deferred;
+        return need_result::deferred;
+    }
+    plan.no_progress_turns++;
+    if( plan.no_progress_turns >= 5 ) {
+        plan.clear();
+        plan.last_result = need_result::impossible;
+        return need_result::impossible;
+    }
+    plan.last_result = need_result::blocked;
+    return need_result::blocked;
 }
 
 bool npc::adjust_worn()

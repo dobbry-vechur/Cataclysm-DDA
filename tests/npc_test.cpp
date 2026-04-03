@@ -4556,7 +4556,9 @@ TEST_CASE( "npc_food_executor_contract", "[npc][needs][forage]" )
     clear_character( guy, true );
     guy.set_fac( faction_your_followers );
     guy.set_attitude( NPCATT_FOLLOW );
-    guy.set_stored_kcal( 1000 );
+    // Low enough for calorie deficit and needs_food_badly, high enough to
+    // survive the test without starving to death.
+    guy.set_stored_kcal( 20000 );
     guy.set_hunger( -1 );
     guy.set_thirst( 0 );
 
@@ -4631,8 +4633,9 @@ TEST_CASE( "npc_food_executor_contract", "[npc][needs][forage]" )
         here.ter_set( bush, ter_t_floor );
         here.build_map_cache( 0 );
 
-        // Place a new target away from the player path (player is south).
-        const tripoint_bub_ms bush2 = tripoint_bub_ms{ 45, 47, 0 };
+        // Place a new target within scan range of the NPC's current position,
+        // away from the player path (player is south at y=55).
+        const tripoint_bub_ms bush2 = guy.pos_bub() + tripoint( 0, -3, 0 );
         here.ter_set( bush2, ter_t_underbrush );
         here.build_map_cache( 0 );
 
@@ -4709,6 +4712,35 @@ TEST_CASE( "npc_food_executor_contract", "[npc][needs][forage]" )
         }
         // Should keep going east toward original target, not veer north.
         CHECK( east_moves > north_moves );
+    }
+
+    SECTION( "danger gate defers plan without killing it" ) {
+        const tripoint_bub_ms bush = guy.pos_bub() + tripoint( 3, 0, 0 );
+        here.ter_set( bush, ter_t_underbrush );
+        here.build_map_cache( 0 );
+        guy.set_committed_goal( "eat_food" );
+
+        // Let the NPC acquire a target and start moving.
+        guy.set_moves( 100 );
+        guy.move();
+        REQUIRE( guy.get_committed_goal() == "eat_food" );
+
+        // Raise danger above the gate for several turns.
+        guy.set_ai_danger( NPC_DANGER_VERY_LOW + 1 );
+        for( int turn = 0; turn < 8; ++turn ) {
+            guy.set_moves( 100 );
+            guy.move();
+        }
+        // Plan should still be committed, not cleared as impossible.
+        CHECK( guy.get_committed_goal() == "eat_food" );
+
+        // Drop danger. NPC should resume and reach/forage the target.
+        guy.set_ai_danger( 0 );
+        for( int turn = 0; turn < 3; ++turn ) {
+            guy.set_moves( 100 );
+            guy.move();
+        }
+        CHECK( rl_dist( guy.pos_bub(), bush ) <= 1 );
     }
 }
 
