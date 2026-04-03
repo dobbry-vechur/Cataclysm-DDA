@@ -1306,7 +1306,7 @@ TEST_CASE( "npc_camp_water_through_stomach", "[npc][needs][camp]" )
         REQUIRE( guy.has_calorie_deficit() );
         REQUIRE( guy.get_hunger() <= 0 );
 
-        CHECK( guy.consume_food_from_camp( true ) );
+        CHECK( guy.consume_food_from_camp( npc::consume_filter::food_only ) );
         CHECK( camp_faction->food_supply().kcal() < 50 );
     }
 }
@@ -4784,8 +4784,8 @@ TEST_CASE( "npc_food_executor_contract", "[npc][needs][forage]" )
         auto result = guy.execute_need_goal( "eat_food" );
         REQUIRE( result == npc::need_result::progressed );
         REQUIRE( guy.get_food_plan().active() );
-        using food_source = npc_short_term_cache::food_source;
-        REQUIRE( guy.get_food_plan().source_kind == food_source::harvestable );
+        using need_source = npc_short_term_cache::need_source;
+        REQUIRE( guy.get_food_plan().source_kind == need_source::harvestable );
 
         // Change terrain to non-food harvestable (dead tree = sticks only).
         here.ter_set( tree_pos, ter_t_tree_dead );
@@ -4898,5 +4898,194 @@ TEST_CASE( "npc_can_obtain_food_filters_harvests", "[npc][needs][forage]" )
     SECTION( "no harvestable terrain nearby" ) {
         here.build_map_cache( 0 );
         CHECK( oracle.can_obtain_food( "" ) == behavior::status_t::failure );
+    }
+}
+
+// Executor-level tests for drink_water goal: water terrain sources,
+// inventory drinks, drink-only filtering, sticky targets, progress tracking.
+TEST_CASE( "npc_water_executor_contract", "[npc][needs][water]" )
+{
+    clear_map_without_vision();
+    clear_avatar();
+    get_player_character().camps.clear();
+    get_player_character().setpos( get_map(), tripoint_bub_ms{ 50, 55, 0 } );
+    get_weather().forced_temperature = 20_C;
+    set_time_to_day();
+
+    npc &guy = spawn_npc( { 50, 50 }, "test_talker" );
+    clear_character( guy, true );
+    guy.set_fac( faction_your_followers );
+    guy.set_attitude( NPCATT_FOLLOW );
+    guy.set_stored_kcal( 55000 );
+    guy.set_hunger( 0 );
+    guy.set_thirst( 200 );
+
+    map &here = get_map();
+
+    SECTION( "walks to water terrain and drinks" ) {
+        const tripoint_bub_ms water = guy.pos_bub() + tripoint( 3, 0, 0 );
+        here.ter_set( water, ter_t_water_sh );
+        here.build_map_cache( 0 );
+
+        guy.set_moves( 100 );
+        auto result = guy.execute_need_goal( "drink_water" );
+        REQUIRE( result == npc::need_result::progressed );
+        REQUIRE( guy.get_water_plan().active() );
+        using need_source = npc_short_term_cache::need_source;
+        CHECK( guy.get_water_plan().source_kind == need_source::water_terrain );
+    }
+
+    SECTION( "drinks adjacent water terrain immediately" ) {
+        const tripoint_bub_ms water = guy.pos_bub() + point::east;
+        here.ter_set( water, ter_t_water_sh );
+        here.build_map_cache( 0 );
+
+        const int thirst_before = guy.get_thirst();
+        guy.set_moves( 100 );
+        auto result = guy.execute_need_goal( "drink_water" );
+        CHECK( result == npc::need_result::satisfied );
+        CHECK( guy.get_thirst() < thirst_before );
+    }
+
+    SECTION( "drink_water executor skips pure-food items" ) {
+        // Crackers in inventory (nutrition only, negative quench).
+        guy.i_add( item( itype_crackers ) );
+
+        guy.set_moves( 100 );
+        auto result = guy.execute_need_goal( "drink_water" );
+        // No water source exists; crackers don't count.
+        CHECK( result == npc::need_result::impossible );
+    }
+
+    SECTION( "no water anywhere returns impossible" ) {
+        here.build_map_cache( 0 );
+
+        guy.set_moves( 100 );
+        auto result = guy.execute_need_goal( "drink_water" );
+        CHECK( result == npc::need_result::impossible );
+    }
+
+    SECTION( "water plan sticks to original target" ) {
+        const tripoint_bub_ms east_water = guy.pos_bub() + tripoint( 4, 0, 0 );
+        here.ter_set( east_water, ter_t_water_sh );
+        here.build_map_cache( 0 );
+
+        // Acquire target.
+        guy.set_moves( 100 );
+        guy.execute_need_goal( "drink_water" );
+        REQUIRE( guy.get_water_plan().active() );
+
+        // Add closer water to the north.
+        const tripoint_bub_ms north_water = guy.pos_bub() + tripoint( 0, -2, 0 );
+        here.ter_set( north_water, ter_t_water_sh );
+        here.build_map_cache( 0 );
+
+        // NPC should keep pursuing original target.
+        tripoint_bub_ms prev = guy.pos_bub();
+        int east_moves = 0;
+        int north_moves = 0;
+        for( int turn = 0; turn < 3; ++turn ) {
+            guy.set_moves( 100 );
+            guy.execute_need_goal( "drink_water" );
+            const tripoint_bub_ms cur = guy.pos_bub();
+            if( cur.x() > prev.x() ) {
+                east_moves++;
+            }
+            if( cur.y() < prev.y() ) {
+                north_moves++;
+            }
+            prev = cur;
+        }
+        CHECK( east_moves > north_moves );
+    }
+
+    SECTION( "danger gate defers without killing plan" ) {
+        const tripoint_bub_ms water = guy.pos_bub() + tripoint( 3, 0, 0 );
+        here.ter_set( water, ter_t_water_sh );
+        here.build_map_cache( 0 );
+
+        // Low danger: acquire target.
+        guy.set_ai_danger( 0 );
+        guy.set_moves( 100 );
+        auto result = guy.execute_need_goal( "drink_water" );
+        REQUIRE( result == npc::need_result::progressed );
+
+        // High danger: deferred.
+        guy.set_ai_danger( NPC_DANGER_VERY_LOW + 1 );
+        guy.set_moves( 100 );
+        result = guy.execute_need_goal( "drink_water" );
+        CHECK( result == npc::need_result::deferred );
+        CHECK( guy.get_water_plan().active() );
+
+        // Low danger: resumes.
+        guy.set_ai_danger( 0 );
+        guy.set_moves( 100 );
+        result = guy.execute_need_goal( "drink_water" );
+        CHECK( result == npc::need_result::progressed );
+    }
+}
+
+// drink_water commitment lifecycle through npc::move().
+TEST_CASE( "npc_drink_water_commitment_clears_when_unobtainable", "[npc][needs][water]" )
+{
+    clear_map_without_vision();
+    clear_avatar();
+    get_player_character().camps.clear();
+    get_player_character().setpos( get_map(), tripoint_bub_ms{ 10, 10, 0 } );
+    get_weather().forced_temperature = 20_C;
+    set_time_to_day();
+
+    npc &guy = spawn_npc( { 50, 50 }, "test_talker" );
+    clear_character( guy, true );
+    guy.set_fac( faction_your_followers );
+    guy.set_attitude( NPCATT_FOLLOW );
+    guy.set_stored_kcal( 55000 );
+    guy.set_hunger( 0 );
+    // Must exceed needs_water_badly threshold (520) so the commitment
+    // doesn't clear via the "satisfied" path before the executor runs.
+    guy.set_thirst( 600 );
+    REQUIRE( guy.get_thirst() > 520 );
+
+    map &here = get_map();
+    here.build_map_cache( 0 );
+
+    guy.set_committed_goal( "drink_water" );
+
+    for( int turn = 0; turn < 5; ++turn ) {
+        guy.set_moves( 100 );
+        guy.move();
+    }
+    CHECK( guy.get_committed_goal() != "drink_water" );
+}
+
+// can_obtain_water should detect nearby water terrain sources.
+TEST_CASE( "npc_can_obtain_water_predicate", "[npc][needs][water]" )
+{
+    clear_map_without_vision();
+    set_time_to_day();
+
+    npc &guy = spawn_npc( { 50, 50 }, "test_talker" );
+    clear_character( guy, true );
+    guy.set_thirst( 200 );
+
+    map &here = get_map();
+    const tripoint_bub_ms adj = guy.pos_bub() + point::east;
+    behavior::character_oracle_t oracle( &guy );
+
+    SECTION( "fresh shallow water is obtainable" ) {
+        here.ter_set( adj, ter_t_water_sh );
+        here.build_map_cache( 0 );
+        CHECK( oracle.can_obtain_water( "" ) == behavior::status_t::running );
+    }
+
+    SECTION( "salt water is not obtainable" ) {
+        here.ter_set( adj, ter_t_swater_sh );
+        here.build_map_cache( 0 );
+        CHECK( oracle.can_obtain_water( "" ) == behavior::status_t::failure );
+    }
+
+    SECTION( "no water terrain nearby" ) {
+        here.build_map_cache( 0 );
+        CHECK( oracle.can_obtain_water( "" ) == behavior::status_t::failure );
     }
 }

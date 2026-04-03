@@ -569,11 +569,11 @@ struct npc_short_term_cache {
 
     // Per-goal executor state. Tracks a concrete target so the executor
     // does not rescan and dither every turn.
-    enum class food_source : int { none, ground_item, harvestable };
+    enum class need_source : int { none, ground_item, harvestable, water_terrain };
 
     struct need_plan {
         std::string goal;
-        food_source source_kind = food_source::none;
+        need_source source_kind = need_source::none;
         tripoint_abs_ms target;
         need_result last_result = need_result::idle;
         int no_progress_turns = 0;
@@ -586,6 +586,10 @@ struct npc_short_term_cache {
         }
     };
     need_plan food_plan;
+    need_plan water_plan;
+
+    // Filter for consume_food / find_nearby_food / consume_food_from_camp.
+    enum class consume_filter : int { any, food_only, drink_only };
 
     // Cache of locations the NPC has searched recently in npc::find_item()
     lru_cache<tripoint_abs_ms, int> searched_tiles;
@@ -1193,7 +1197,8 @@ class npc : public Character
             int dist;
         };
         std::vector<scored_water_source> find_nearby_water_sources() const;
-        std::vector<scored_item> find_nearby_food( bool food_only = false );
+        using consume_filter = npc_short_term_cache::consume_filter;
+        std::vector<scored_item> find_nearby_food( consume_filter filter = consume_filter::any );
         std::vector<scored_item> find_nearby_warm_clothing();
         std::vector<scored_shelter> find_nearby_shelters() const;
         std::vector<scored_water_source> find_nearby_harvestable( bool food_only = false ) const;
@@ -1314,8 +1319,8 @@ class npc : public Character
         // Do we have an idea of where u are?
         bool saw_player_recently() const;
         /** Returns true if food was consumed, false otherwise. */
-        bool consume_food( bool food_only = false );
-        bool consume_food_from_camp( bool food_only = false );
+        bool consume_food( consume_filter filter = consume_filter::any );
+        bool consume_food_from_camp( consume_filter filter = consume_filter::any );
         int get_thirst() const override;
 
         // Movement on the overmap scale
@@ -1420,6 +1425,8 @@ class npc : public Character
         float get_ai_danger() const {
             return ai_cache.danger;
         }
+        // Test-only: inject danger for executor-level tests that bypass move().
+        // Not for general use -- regen_ai_cache() overwrites danger every turn.
         void set_ai_danger( float d ) {
             ai_cache.danger = d;
         }
@@ -1440,11 +1447,17 @@ class npc : public Character
         }
         using need_result = npc_short_term_cache::need_result;
         using need_plan = npc_short_term_cache::need_plan;
+        using need_source = npc_short_term_cache::need_source;
         // Execute the concrete action for a needs-category goal.
         // Owns target selection and progress tracking.
         need_result execute_need_goal( const std::string &goal );
+        need_result execute_eat_food();
+        need_result execute_drink_water();
         const need_plan &get_food_plan() const {
             return ai_cache.food_plan;
+        }
+        const need_plan &get_water_plan() const {
+            return ai_cache.water_plan;
         }
         // Persistent duty post from mission/dialogue assignment.
         // Used by BT duty predicates. Does NOT include ephemeral

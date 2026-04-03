@@ -112,13 +112,25 @@
     "id": "npc_thirst",
     "strategy": "sequential",
     "conditions": [ { "predicate": "npc_needs_water_badly" } ],
-    "children": [ "npc_drink_water" ],
+    "children": [ "npc_obtain_water" ],
     "score": "npc_thirst_urgency"
+  },
+  {
+    "type": "behavior",
+    "id": "npc_obtain_water",
+    "strategy": "fallback",
+    "children": [ "npc_drink_water", "npc_seek_water" ]
   },
   {
     "type": "behavior",
     "id": "npc_drink_water",
     "conditions": [ { "predicate": "npc_has_water" } ],
+    "goal": "drink_water"
+  },
+  {
+    "type": "behavior",
+    "id": "npc_seek_water",
+    "conditions": [ { "predicate": "npc_can_obtain_water" } ],
     "goal": "drink_water"
   },
   {

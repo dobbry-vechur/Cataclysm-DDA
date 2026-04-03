@@ -1733,9 +1733,13 @@ void npc::move()
                     }
                 } else if( committed == "drink_water" ) {
                     behavior::character_oracle_t oracle( this );
-                    completed_goal =
-                        oracle.needs_water_badly( "" ) != behavior::status_t::running ||
-                        oracle.has_water( "" ) != behavior::status_t::running;
+                    bool satisfied = oracle.needs_water_badly( "" ) != behavior::status_t::running;
+                    bool exec_impossible = ai_cache.water_plan.last_result ==
+                                           need_result::impossible;
+                    completed_goal = satisfied || exec_impossible;
+                    if( completed_goal ) {
+                        ai_cache.water_plan.clear();
+                    }
                 } else if( committed == "camp_work" ) {
                     completed_goal = ( new_goal != "camp_work" );
                 } else if( committed == "return_to_camp" ) {
@@ -1753,6 +1757,8 @@ void npc::move()
                         // Clear stale plan when overridden by higher priority.
                         if( committed == "eat_food" ) {
                             ai_cache.food_plan.clear();
+                        } else if( committed == "drink_water" ) {
+                            ai_cache.water_plan.clear();
                         }
                         committed = new_goal;
                     } else {
@@ -1807,7 +1813,7 @@ void npc::move()
                     // own fallback logic like lying_down on meth).
                     action = address_needs();
                 }
-            } else if( new_goal == "eat_food" ) {
+            } else if( new_goal == "eat_food" || new_goal == "drink_water" ) {
                 const need_result result = execute_need_goal( new_goal );
                 if( result == need_result::progressed && activity ) {
                     // Undo attitude/mission change from assign_activity.
@@ -1822,28 +1828,29 @@ void npc::move()
                     committed.clear();
                     action = npc_undecided;
                 } else {
-                    // blocked: pause this turn, don't yield to follow/goto
+                    // blocked/deferred: pause this turn, don't yield to follow/goto
                     // which would pull the NPC away and cause oscillation
                     action = npc_pause;
                 }
             } else {
-                // Other needs (sleep, drink, warmth). Legacy address_needs.
+                // Other needs (sleep, warmth). Legacy address_needs.
                 action = address_needs();
             }
 
             // Debug: executor state for needs goals.
-            if( new_goal == "eat_food" ) {
-                const need_plan &fp = ai_cache.food_plan;
+            if( new_goal == "eat_food" || new_goal == "drink_water" ) {
+                const need_plan &np = ( new_goal == "eat_food" ) ?
+                                      ai_cache.food_plan : ai_cache.water_plan;
                 static const std::array<const char *, 6> result_names = {{
                         "idle", "progressed", "satisfied", "blocked", "deferred", "impossible"
                     }
                 };
                 add_msg_debug( debugmode::DF_NPC_NEEDS,
-                               "NPC %s: food_plan target=%s result=%s no_progress=%d",
-                               get_name(),
-                               fp.active() ? fp.target.to_string().c_str() : "none",
-                               result_names[static_cast<int>( fp.last_result )],
-                               fp.no_progress_turns );
+                               "NPC %s: %s target=%s result=%s no_progress=%d",
+                               get_name(), new_goal,
+                               np.active() ? np.target.to_string().c_str() : "none",
+                               result_names[static_cast<int>( np.last_result )],
+                               np.no_progress_turns );
             }
         }
         print_action( "address_needs %s", action );
@@ -5213,7 +5220,7 @@ static float rate_food( const Character &who, const item &it, int want_nutr,
     return weight;
 }
 
-bool npc::consume_food_from_camp( bool food_only )
+bool npc::consume_food_from_camp( consume_filter filter )
 {
     Character &player_character = get_player_character();
     std::optional<basecamp *> potential_bc;
@@ -5232,7 +5239,8 @@ bool npc::consume_food_from_camp( bool food_only )
 
     // Handle water -- route through stomach so thirst decreases naturally.
     // Skipped when food_only is set (eat_food executor must not satisfy thirst).
-    if( !food_only && get_thirst() > 40 && bcp->has_water() && bcp->allowed_access_by( *this, true ) ) {
+    if( filter != consume_filter::food_only &&
+        get_thirst() > 40 && bcp->has_water() && bcp->allowed_access_by( *this, true ) ) {
         const units::volume want = std::max( 0_ml,
                                              units::from_milliliter( get_thirst() * 5 ) );
         const units::volume room = stomach.stomach_remaining( *this );
@@ -5245,7 +5253,10 @@ bool npc::consume_food_from_camp( bool food_only )
         }
     }
 
-    // Handle food
+    // Handle food (skipped in drink_only mode).
+    if( filter == consume_filter::drink_only ) {
+        return false;
+    }
     int current_kcals = get_stored_kcal() + stomach.get_calories() + guts.get_calories();
     int kcal_threshold = get_healthy_kcal() * 19 / 20;
     if( ( get_hunger() > 0 || has_calorie_deficit() ) &&
@@ -5271,7 +5282,7 @@ bool npc::consume_food_from_camp( bool food_only )
     return false;
 }
 
-bool npc::consume_food( bool food_only )
+bool npc::consume_food( consume_filter filter )
 {
     float best_weight = 0.0f;
     item_location best_food;
@@ -5282,8 +5293,13 @@ bool npc::consume_food( bool food_only )
     if( want_hunger == 0 && has_calorie_deficit() ) {
         want_hunger = 100;
     }
-    // food_only: ignore thirst so the scorer only ranks by nutritional value.
-    int want_quench = food_only ? 0 : std::max( 0, get_thirst() );
+    // food_only: ignore thirst. drink_only: ignore hunger.
+    if( filter == consume_filter::food_only ) {
+        want_hunger = std::max( want_hunger, 100 );
+    } else if( filter == consume_filter::drink_only ) {
+        want_hunger = 0;
+    }
+    int want_quench = ( filter == consume_filter::food_only ) ? 0 : std::max( 0, get_thirst() );
 
     const std::vector<item_location> inv_food = cache_get_items_with( "is_food", &item::is_food );
 
@@ -5295,10 +5311,15 @@ bool npc::consume_food( bool food_only )
         }
     } else {
         for( const item_location &food_item : inv_food ) {
-            // In food_only mode, skip items with no nutritional value (pure drinks).
-            if( food_only ) {
-                const auto &com = food_item->get_comestible();
+            // food_only: skip items with no nutritional value (pure drinks).
+            // drink_only: skip items with no hydration value (pure food).
+            const auto &com = food_item->get_comestible();
+            if( filter == consume_filter::food_only ) {
                 if( !com || com->get_default_nutr() <= 0 ) {
+                    continue;
+                }
+            } else if( filter == consume_filter::drink_only ) {
+                if( !com || com->quench <= 0 ) {
                     continue;
                 }
             }
@@ -6113,11 +6134,18 @@ bool npc::take_shelter_nearby()
     return false;
 }
 
-std::vector<npc::scored_water_source> npc::find_nearby_water_sources() const
+static bool is_allowed_water_source( const ter_t &t )
 {
     static const std::set<itype_id> allowed = {
         itype_water, itype_water_clean
     };
+    return !t.liquid_source_item_id.is_null() &&
+           t.liquid_source_count == std::make_pair( 0, 0 ) &&
+           allowed.count( t.liquid_source_item_id ) > 0;
+}
+
+std::vector<npc::scored_water_source> npc::find_nearby_water_sources() const
+{
     std::vector<scored_water_source> results;
     const map &here = get_map();
     for( const tripoint_bub_ms &p : closest_points_first( pos_bub(), 6 ) ) {
@@ -6127,14 +6155,7 @@ std::vector<npc::scored_water_source> npc::find_nearby_water_sources() const
         if( !sees( here, p ) ) {
             continue;
         }
-        const ter_t &t = here.ter( p ).obj();
-        if( t.liquid_source_item_id.is_null() ) {
-            continue;
-        }
-        if( t.liquid_source_count != std::make_pair( 0, 0 ) ) {
-            continue;
-        }
-        if( allowed.count( t.liquid_source_item_id ) == 0 ) {
+        if( !is_allowed_water_source( here.ter( p ).obj() ) ) {
             continue;
         }
         results.push_back( { p, rl_dist( pos_bub(), p ) } );
@@ -6146,7 +6167,7 @@ std::vector<npc::scored_water_source> npc::find_nearby_water_sources() const
     return results;
 }
 
-std::vector<npc::scored_item> npc::find_nearby_food( bool food_only )
+std::vector<npc::scored_item> npc::find_nearby_food( consume_filter filter )
 {
     std::vector<scored_item> results;
     if( is_player_ally() && !rules.has_flag( ally_rule::allow_pick_up ) ) {
@@ -6156,8 +6177,14 @@ std::vector<npc::scored_item> npc::find_nearby_food( bool food_only )
     if( want_hunger == 0 && has_calorie_deficit() ) {
         want_hunger = 100;
     }
-    // food_only: ignore thirst so the scorer only ranks by nutritional value.
-    const int want_quench = food_only ? 0 : std::max( 0, get_thirst() );
+    // food_only: ignore thirst. drink_only: ignore hunger.
+    if( filter == consume_filter::food_only ) {
+        want_hunger = std::max( want_hunger, 100 );
+    } else if( filter == consume_filter::drink_only ) {
+        want_hunger = 0;
+    }
+    const int want_quench = ( filter == consume_filter::food_only ) ?
+                            0 : std::max( 0, get_thirst() );
     map &here = get_map();
 
     static const std::string locked_string( "LOCKED" );
@@ -6170,11 +6197,18 @@ std::vector<npc::scored_item> npc::find_nearby_food( bool food_only )
         {
             return false;
         }
-        // In food_only mode, skip items with no nutritional value (pure drinks).
-        if( food_only )
+        // food_only: skip items with no nutritional value (pure drinks).
+        // drink_only: skip items with no hydration value (pure food).
+        if( filter == consume_filter::food_only )
         {
             const auto &com = it.get_comestible();
             if( !com || com->get_default_nutr() <= 0 ) {
+                return false;
+            }
+        } else if( filter == consume_filter::drink_only )
+        {
+            const auto &com = it.get_comestible();
+            if( !com || com->quench <= 0 ) {
                 return false;
             }
         }
@@ -6454,30 +6488,38 @@ std::vector<npc::scored_water_source> npc::find_nearby_harvestable( bool food_on
 
 npc::need_result npc::execute_need_goal( const std::string &goal )
 {
-    if( goal != "eat_food" ) {
-        return need_result::idle;
+    if( goal == "eat_food" ) {
+        return execute_eat_food();
     }
+    if( goal == "drink_water" ) {
+        return execute_drink_water();
+    }
+    return need_result::idle;
+}
 
+npc::need_result npc::execute_eat_food()
+{
     // Mirror the legacy danger gate: non-adjacent food seeking is
     // only safe at low danger (same threshold as address_needs).
     const bool low_danger = ai_cache.danger <= NPC_DANGER_VERY_LOW;
+    const consume_filter cf = consume_filter::food_only;
 
     need_plan &plan = ai_cache.food_plan;
     map &here = get_map();
 
     // 1. Try camp food (calories only, skip the water path),
     //    inventory food, then adjacent ground food.
-    if( consume_food_from_camp( true ) ) {
+    if( consume_food_from_camp( cf ) ) {
         plan.clear();
         return need_result::satisfied;
     }
-    if( consume_food( true ) ) {
+    if( consume_food( cf ) ) {
         plan.clear();
         return need_result::satisfied;
     }
     {
         map &food_map = get_map();
-        for( scored_item &c : find_nearby_food( true ) ) {
+        for( scored_item &c : find_nearby_food( cf ) ) {
             if( square_dist( pos_bub(), c.loc.pos_bub( food_map ) ) <= 1 ) {
                 if( consume_food_at( c.loc ) ) {
                     plan.clear();
@@ -6487,22 +6529,22 @@ npc::need_result npc::execute_need_goal( const std::string &goal )
         }
     }
 
-    using food_source = npc_short_term_cache::food_source;
+    using need_source = npc_short_term_cache::need_source;
 
     // 2. Validate existing target.
     if( plan.active() ) {
         const tripoint_bub_ms target_bub = here.get_bub( plan.target );
         bool still_valid = false;
-        if( plan.source_kind == food_source::ground_item ) {
+        if( plan.source_kind == need_source::ground_item ) {
             // Check ground items and vehicle cargo at the target tile.
             still_valid = false;
-            for( const scored_item &c : find_nearby_food( true ) ) {
+            for( const scored_item &c : find_nearby_food( cf ) ) {
                 if( here.get_abs( c.loc.pos_bub( here ) ) == plan.target ) {
                     still_valid = true;
                     break;
                 }
             }
-        } else if( plan.source_kind == food_source::harvestable ) {
+        } else if( plan.source_kind == need_source::harvestable ) {
             still_valid = harvest_yields_food( here, target_bub );
         }
         if( !still_valid ) {
@@ -6514,9 +6556,9 @@ npc::need_result npc::execute_need_goal( const std::string &goal )
     //    Priority: distant ground food first, then harvestable terrain.
     if( !plan.active() ) {
         // Ground food (same scan as address_needs extreme path).
-        for( const scored_item &c : find_nearby_food( true ) ) {
-            plan.goal = goal;
-            plan.source_kind = food_source::ground_item;
+        for( const scored_item &c : find_nearby_food( cf ) ) {
+            plan.goal = "eat_food";
+            plan.source_kind = need_source::ground_item;
             plan.target = here.get_abs( c.loc.pos_bub( here ) );
             plan.last_result = need_result::idle;
             plan.no_progress_turns = 0;
@@ -6527,8 +6569,8 @@ npc::need_result npc::execute_need_goal( const std::string &goal )
         // Harvestable terrain (food-yielding only).
         const auto sources = find_nearby_harvestable( true );
         if( !sources.empty() ) {
-            plan.goal = goal;
-            plan.source_kind = food_source::harvestable;
+            plan.goal = "eat_food";
+            plan.source_kind = need_source::harvestable;
             plan.target = here.get_abs( sources.front().pos );
             plan.last_result = need_result::idle;
             plan.no_progress_turns = 0;
@@ -6543,11 +6585,11 @@ npc::need_result npc::execute_need_goal( const std::string &goal )
     // 4. Execute based on source kind.
     const tripoint_bub_ms target_bub = here.get_bub( plan.target );
 
-    if( plan.source_kind == food_source::ground_item ) {
+    if( plan.source_kind == need_source::ground_item ) {
         if( square_dist( pos_bub(), target_bub ) <= 1 ) {
             // Try consuming from the same scan that find_nearby_food uses
             // (covers both ground items and vehicle cargo).
-            for( scored_item &c : find_nearby_food( true ) ) {
+            for( scored_item &c : find_nearby_food( cf ) ) {
                 if( here.get_abs( c.loc.pos_bub( here ) ) == plan.target &&
                     consume_food_at( c.loc ) ) {
                     plan.clear();
@@ -6559,7 +6601,7 @@ npc::need_result npc::execute_need_goal( const std::string &goal )
             plan.no_progress_turns = 0;
             return need_result::progressed;
         }
-    } else if( plan.source_kind == food_source::harvestable ) {
+    } else if( plan.source_kind == need_source::harvestable ) {
         if( square_dist( pos_bub(), target_bub ) <= 1 ) {
             here.examine( *this, target_bub );
             if( activity ) {
@@ -6577,6 +6619,138 @@ npc::need_result npc::execute_need_goal( const std::string &goal )
     // 5. No progress this turn.
     // If the target is distant and danger blocked movement, that's a policy
     // deferral, not an executor failure. Don't count toward no_progress_turns.
+    if( !low_danger && square_dist( pos_bub(), target_bub ) > 1 ) {
+        plan.last_result = need_result::deferred;
+        return need_result::deferred;
+    }
+    plan.no_progress_turns++;
+    if( plan.no_progress_turns >= 5 ) {
+        plan.clear();
+        plan.last_result = need_result::impossible;
+        return need_result::impossible;
+    }
+    plan.last_result = need_result::blocked;
+    return need_result::blocked;
+}
+
+npc::need_result npc::execute_drink_water()
+{
+    const bool low_danger = ai_cache.danger <= NPC_DANGER_VERY_LOW;
+    const consume_filter cf = consume_filter::drink_only;
+
+    need_plan &plan = ai_cache.water_plan;
+    map &here = get_map();
+
+    // 1. Try camp water, inventory drinks, adjacent ground drinks,
+    //    then adjacent water terrain sources.
+    if( consume_food_from_camp( cf ) ) {
+        plan.clear();
+        return need_result::satisfied;
+    }
+    if( consume_food( cf ) ) {
+        plan.clear();
+        return need_result::satisfied;
+    }
+    {
+        map &water_map = get_map();
+        for( scored_item &c : find_nearby_food( cf ) ) {
+            if( square_dist( pos_bub(), c.loc.pos_bub( water_map ) ) <= 1 ) {
+                if( consume_food_at( c.loc ) ) {
+                    plan.clear();
+                    return need_result::satisfied;
+                }
+            }
+        }
+    }
+    for( scored_water_source &ws : find_nearby_water_sources() ) {
+        if( square_dist( pos_bub(), ws.pos ) <= 1 ) {
+            if( drink_from_water_source( ws.pos ) ) {
+                plan.clear();
+                return need_result::satisfied;
+            }
+        }
+    }
+
+    using need_source = npc_short_term_cache::need_source;
+
+    // 2. Validate existing target.
+    if( plan.active() ) {
+        const tripoint_bub_ms target_bub = here.get_bub( plan.target );
+        bool still_valid = false;
+        if( plan.source_kind == need_source::ground_item ) {
+            for( const scored_item &c : find_nearby_food( cf ) ) {
+                if( here.get_abs( c.loc.pos_bub( here ) ) == plan.target ) {
+                    still_valid = true;
+                    break;
+                }
+            }
+        } else if( plan.source_kind == need_source::water_terrain ) {
+            still_valid = is_allowed_water_source( here.ter( target_bub ).obj() );
+        }
+        if( !still_valid ) {
+            plan.clear();
+        }
+    }
+
+    // 3. Acquire target if we don't have one.
+    //    Priority: ground drink items first, then water terrain.
+    if( !plan.active() ) {
+        for( const scored_item &c : find_nearby_food( cf ) ) {
+            plan.goal = "drink_water";
+            plan.source_kind = need_source::ground_item;
+            plan.target = here.get_abs( c.loc.pos_bub( here ) );
+            plan.last_result = need_result::idle;
+            plan.no_progress_turns = 0;
+            break;
+        }
+    }
+    if( !plan.active() ) {
+        for( const scored_water_source &ws : find_nearby_water_sources() ) {
+            plan.goal = "drink_water";
+            plan.source_kind = need_source::water_terrain;
+            plan.target = here.get_abs( ws.pos );
+            plan.last_result = need_result::idle;
+            plan.no_progress_turns = 0;
+            break;
+        }
+    }
+    if( !plan.active() ) {
+        plan.clear();
+        plan.last_result = need_result::impossible;
+        return need_result::impossible;
+    }
+
+    // 4. Execute based on source kind.
+    const tripoint_bub_ms target_bub = here.get_bub( plan.target );
+
+    if( plan.source_kind == need_source::ground_item ) {
+        if( square_dist( pos_bub(), target_bub ) <= 1 ) {
+            for( scored_item &c : find_nearby_food( cf ) ) {
+                if( here.get_abs( c.loc.pos_bub( here ) ) == plan.target &&
+                    consume_food_at( c.loc ) ) {
+                    plan.clear();
+                    return need_result::satisfied;
+                }
+            }
+        } else if( low_danger && move_to_and_verify( target_bub ) ) {
+            plan.last_result = need_result::progressed;
+            plan.no_progress_turns = 0;
+            return need_result::progressed;
+        }
+    } else if( plan.source_kind == need_source::water_terrain ) {
+        if( square_dist( pos_bub(), target_bub ) <= 1 ) {
+            if( drink_from_water_source( target_bub ) ) {
+                plan.clear();
+                return need_result::satisfied;
+            }
+        } else if( low_danger && move_to_and_verify( target_bub ) ) {
+            plan.last_result = need_result::progressed;
+            plan.no_progress_turns = 0;
+            return need_result::progressed;
+        }
+    }
+
+    // 5. No progress this turn.
     if( !low_danger && square_dist( pos_bub(), target_bub ) > 1 ) {
         plan.last_result = need_result::deferred;
         return need_result::deferred;

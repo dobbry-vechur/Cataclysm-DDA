@@ -6,16 +6,23 @@
 #include <optional>
 #include <vector>
 
+#include "basecamp.h"
 #include "behavior.h"
 #include "bodypart.h"
 #include "calendar.h"
 #include "character.h"
 #include "coordinates.h"
+#include "game.h"
 #include "item.h"
 #include "itype.h"
+#include "map.h"
+#include "map_iterator.h"
 #include "npc.h"
 #include "npc_class.h"
+#include "overmapbuffer.h"
 #include "point.h"
+#include "vehicle.h"
+#include "vpart_position.h"
 #include "ret_val.h"
 #include "type_id.h"
 #include "units.h"
@@ -137,6 +144,60 @@ status_t character_oracle_t::can_obtain_food( std::string_view ) const
         return status_t::failure;
     }
     return n->find_nearby_harvestable( true ).empty() ? status_t::failure : status_t::running;
+}
+
+status_t character_oracle_t::can_obtain_water( std::string_view ) const
+{
+    const npc *n = dynamic_cast<const npc *>( subject );
+    if( !n ) {
+        return status_t::failure;
+    }
+    // Terrain water sources (wells, rivers).
+    if( !n->find_nearby_water_sources().empty() ) {
+        return status_t::running;
+    }
+    // Visible ground drink items and vehicle cargo within scan range.
+    map &here = get_map();
+    const auto is_drink = []( const item & it ) -> bool {
+        const auto &com = it.get_comestible();
+        return it.is_food() && com && com->quench > 0;
+    };
+    for( const tripoint_bub_ms &p : closest_points_first( n->pos_bub(), 6 ) ) {
+        if( !n->sees( here, p ) ) {
+            continue;
+        }
+        if( here.sees_some_items( p, *n ) ) {
+            for( const item &it : here.i_at( p ) ) {
+                if( is_drink( it ) ) {
+                    return status_t::running;
+                }
+            }
+        }
+        const optional_vpart_position vp = here.veh_at( p );
+        if( vp && !vp->vehicle().is_moving() ) {
+            const std::optional<vpart_reference> cargo = vp.cargo();
+            if( cargo && !cargo->has_feature( "LOCKED" ) &&
+                !vp.part_with_feature( "CARGO_LOCKING", true ) ) {
+                for( const item &it : cargo->items() ) {
+                    if( is_drink( it ) ) {
+                        return status_t::running;
+                    }
+                }
+            }
+        }
+    }
+    // Camp water (must pass the same access check as the executor).
+    const Character &pc = get_player_character();
+    for( const tripoint_abs_omt &camp_pos : pc.camps ) {
+        if( rl_dist( camp_pos.xy(), n->pos_abs_omt().xy() ) < 3 ) {
+            std::optional<basecamp *> bcp = overmap_buffer.find_camp( camp_pos.xy() );
+            if( bcp && ( *bcp )->has_water() &&
+                ( *bcp )->allowed_access_by( const_cast<npc &>( *n ), true ) ) {
+                return status_t::running;
+            }
+        }
+    }
+    return status_t::failure;
 }
 
 status_t character_oracle_t::needs_sleep_badly( std::string_view ) const
