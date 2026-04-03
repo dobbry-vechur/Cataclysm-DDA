@@ -494,7 +494,9 @@ TEST_CASE( "check_npc_behavior_tree", "[npc][behavior]" )
         here.ter_set( adj, ter_t_floor );
         REQUIRE( oracle.can_take_shelter( "" ) == behavior::status_t::running );
 
-        CHECK( npc_needs.tick( &oracle ) == "take_shelter" );
+        // seek_warmth fires before legacy take_shelter because
+        // npc_obtain_warmth is first in the warmth fallback chain.
+        CHECK( npc_needs.tick( &oracle ) == "seek_warmth" );
     }
     SECTION( "Freezing outdoors with no shelter" ) {
         weather_manager &weather = get_weather();

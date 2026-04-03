@@ -569,7 +569,7 @@ struct npc_short_term_cache {
 
     // Per-goal executor state. Tracks a concrete target so the executor
     // does not rescan and dither every turn.
-    enum class need_source : int { none, ground_item, harvestable, water_terrain };
+    enum class need_source : int { none, ground_item, harvestable, water_terrain, ground_clothing, shelter };
 
     struct need_plan {
         std::string goal;
@@ -593,6 +593,8 @@ struct npc_short_term_cache {
     // interact with failure history.
     std::set<tripoint_abs_ms> food_failed_targets;
     std::set<tripoint_abs_ms> water_failed_targets;
+    need_plan warmth_plan;
+    std::set<tripoint_abs_ms> warmth_failed_targets;
 
     // Filter for consume_food / find_nearby_food / consume_food_from_camp.
     enum class consume_filter : int { any, food_only, drink_only };
@@ -1221,6 +1223,7 @@ class npc : public Character
         // the underlying will_eat/rate_food calls are not const-qualified.
         std::vector<need_candidate> find_food_candidates();
         std::vector<need_candidate> find_water_candidates();
+        std::vector<need_candidate> find_warmth_candidates();
         std::vector<scored_item> find_nearby_food( consume_filter filter = consume_filter::any );
         std::vector<scored_item> find_nearby_warm_clothing();
         std::vector<scored_shelter> find_nearby_shelters() const;
@@ -1476,11 +1479,15 @@ class npc : public Character
         need_result execute_need_goal( const std::string &goal );
         need_result execute_eat_food();
         need_result execute_drink_water();
+        need_result execute_seek_warmth();
         const need_plan &get_food_plan() const {
             return ai_cache.food_plan;
         }
         const need_plan &get_water_plan() const {
             return ai_cache.water_plan;
+        }
+        const need_plan &get_warmth_plan() const {
+            return ai_cache.warmth_plan;
         }
         // Persistent duty post from mission/dialogue assignment.
         // Used by BT duty predicates. Does NOT include ephemeral

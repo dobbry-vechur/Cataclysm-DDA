@@ -31,6 +31,7 @@ class character_oracle_t : public oracle_t
         status_t has_food( std::string_view ) const;
         status_t can_obtain_food( std::string_view ) const;
         status_t can_obtain_water( std::string_view ) const;
+        status_t can_obtain_warmth( std::string_view ) const;
         status_t needs_sleep_badly( std::string_view ) const;
         status_t can_sleep( std::string_view ) const;
         /**

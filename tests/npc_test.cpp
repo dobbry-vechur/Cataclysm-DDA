@@ -1589,13 +1589,13 @@ TEST_CASE( "npc_find_nearby_warm_clothing", "[npc][needs]" )
         CHECK( warm[0].loc.get_item()->typeId() == itype_sweater );
     }
 
-    SECTION( "ally without allow_pick_up returns empty" ) {
+    SECTION( "ally without allow_pick_up still finds clothing for wearing" ) {
         guy.set_fac( faction_your_followers );
         guy.set_attitude( NPCATT_FOLLOW );
         REQUIRE( guy.is_player_ally() );
         guy.rules.clear_flag( ally_rule::allow_pick_up );
         here.add_item_or_charges( adj, item( itype_sweater ) );
-        CHECK( guy.find_nearby_warm_clothing().empty() );
+        CHECK_FALSE( guy.find_nearby_warm_clothing().empty() );
     }
 }
 
@@ -5324,6 +5324,366 @@ TEST_CASE( "npc_water_executor_contract", "[npc][needs][water]" )
         guy.set_moves( 100 );
         result = guy.execute_need_goal( "drink_water" );
         CHECK( result == npc::need_result::progressed );
+    }
+}
+
+// Candidate query layer tests for warmth: verify find_warmth_candidates
+// returns the right mix of ground clothing and shelter candidates.
+TEST_CASE( "npc_find_warmth_candidates", "[npc][needs][warmth]" )
+{
+    clear_map_without_vision();
+    clear_avatar();
+    set_time_to_day();
+
+    npc &guy = spawn_npc( { 50, 50 }, "test_talker" );
+    clear_character( guy, true );
+    guy.set_all_parts_temp_conv( BODYTEMP_VERY_COLD );
+    guy.worn.wear_item( guy, item( itype_backpack ), false, false );
+
+    map &here = get_map();
+    const tripoint_bub_ms adj = guy.pos_bub() + point::east;
+    using need_source = npc_short_term_cache::need_source;
+
+    SECTION( "ground clothing yields ground_clothing candidate" ) {
+        here.add_item_or_charges( adj, item( itype_sweater ) );
+        here.build_map_cache( 0 );
+        auto cands = guy.find_warmth_candidates();
+        REQUIRE_FALSE( cands.empty() );
+        CHECK( cands.back().source_kind == need_source::ground_clothing );
+    }
+
+    SECTION( "indoor tile yields shelter candidate" ) {
+        here.ter_set( adj, ter_t_floor );
+        here.build_map_cache( 0 );
+        auto cands = guy.find_warmth_candidates();
+        REQUIRE_FALSE( cands.empty() );
+        CHECK( cands.front().source_kind == need_source::shelter );
+    }
+
+    SECTION( "nearby clothing outranks distant shelter" ) {
+        // Clothing at distance 1 (warmth ~30), shelter at distance 3 (score -3).
+        here.add_item_or_charges( adj, item( itype_sweater ) );
+        tripoint_bub_ms far = guy.pos_bub() + tripoint( 3, 0, 0 );
+        here.ter_set( far, ter_t_floor );
+        here.build_map_cache( 0 );
+        auto cands = guy.find_warmth_candidates();
+        REQUIRE( cands.size() >= 2 );
+        CHECK( cands.front().source_kind == need_source::ground_clothing );
+    }
+
+    SECTION( "no sources yields empty" ) {
+        here.build_map_cache( 0 );
+        CHECK( guy.find_warmth_candidates().empty() );
+    }
+
+    SECTION( "already indoors: no shelter candidates but clothing still found" ) {
+        // Standing on indoor tile: find_nearby_shelters returns empty.
+        here.ter_set( guy.pos_bub(), ter_t_floor );
+        here.add_item_or_charges( adj, item( itype_sweater ) );
+        here.build_map_cache( 0 );
+        auto cands = guy.find_warmth_candidates();
+        REQUIRE_FALSE( cands.empty() );
+        for( const auto &c : cands ) {
+            CHECK( c.source_kind == need_source::ground_clothing );
+        }
+    }
+
+    SECTION( "ally without allow_pick_up still finds ground clothing" ) {
+        guy.set_fac( faction_your_followers );
+        guy.set_attitude( NPCATT_FOLLOW );
+        REQUIRE( guy.is_player_ally() );
+        guy.rules.clear_flag( ally_rule::allow_pick_up );
+        here.add_item_or_charges( adj, item( itype_sweater ) );
+        here.build_map_cache( 0 );
+        auto cands = guy.find_warmth_candidates();
+        REQUIRE_FALSE( cands.empty() );
+        CHECK( cands.front().source_kind == need_source::ground_clothing );
+    }
+}
+
+// Executor-level tests for seek_warmth goal: inventory wear, ground clothing,
+// shelter seeking, danger gating, sticky targets, progress tracking.
+TEST_CASE( "npc_warmth_executor_contract", "[npc][needs][warmth]" )
+{
+    clear_map_without_vision();
+    clear_avatar();
+    get_player_character().camps.clear();
+    get_player_character().setpos( get_map(), tripoint_bub_ms{ 50, 55, 0 } );
+    get_weather().forced_temperature = 20_C;
+    set_time_to_day();
+
+    npc &guy = spawn_npc( { 50, 50 }, "test_talker" );
+    clear_character( guy, true );
+    guy.set_fac( faction_your_followers );
+    guy.set_attitude( NPCATT_FOLLOW );
+    guy.set_stored_kcal( 55000 );
+    guy.set_hunger( 0 );
+    guy.set_thirst( 0 );
+    guy.set_all_parts_temp_conv( BODYTEMP_VERY_COLD );
+    guy.worn.wear_item( guy, item( itype_backpack ), false, false );
+    guy.rules.set_flag( ally_rule::allow_pick_up );
+
+    map &here = get_map();
+    using need_source = npc_short_term_cache::need_source;
+
+    SECTION( "inventory sweater: wear immediately, progressed" ) {
+        guy.i_add( item( itype_sweater ) );
+        REQUIRE_FALSE( guy.is_wearing( itype_sweater ) );
+
+        guy.set_moves( 100 );
+        auto result = guy.execute_need_goal( "seek_warmth" );
+        // One sweater may not resolve extreme cold, so progressed not satisfied.
+        CHECK( result == npc::need_result::progressed );
+        CHECK( guy.is_wearing( itype_sweater ) );
+    }
+
+    SECTION( "adjacent ground clothing: wear in place, progressed" ) {
+        const tripoint_bub_ms adj = guy.pos_bub() + point::east;
+        here.add_item_or_charges( adj, item( itype_sweater ) );
+        here.build_map_cache( 0 );
+
+        guy.set_moves( 100 );
+        auto result = guy.execute_need_goal( "seek_warmth" );
+        CHECK( result == npc::need_result::progressed );
+        CHECK( guy.is_wearing( itype_sweater ) );
+    }
+
+    SECTION( "distant ground clothing: move toward, progressed" ) {
+        const tripoint_bub_ms far = guy.pos_bub() + tripoint( 4, 0, 0 );
+        here.add_item_or_charges( far, item( itype_sweater ) );
+        here.build_map_cache( 0 );
+
+        guy.set_moves( 100 );
+        auto result = guy.execute_need_goal( "seek_warmth" );
+        CHECK( result == npc::need_result::progressed );
+        CHECK( guy.get_warmth_plan().active() );
+        CHECK( guy.get_warmth_plan().source_kind == need_source::ground_clothing );
+    }
+
+    SECTION( "distant shelter: move toward at low danger, progressed" ) {
+        const tripoint_bub_ms far = guy.pos_bub() + tripoint( 4, 0, 0 );
+        here.ter_set( far, ter_t_floor );
+        here.build_map_cache( 0 );
+
+        guy.set_ai_danger( 0 );
+        guy.set_moves( 100 );
+        auto result = guy.execute_need_goal( "seek_warmth" );
+        CHECK( result == npc::need_result::progressed );
+        CHECK( guy.get_warmth_plan().active() );
+        CHECK( guy.get_warmth_plan().source_kind == need_source::shelter );
+    }
+
+    SECTION( "shelter movement blocked by danger, deferred" ) {
+        const tripoint_bub_ms far = guy.pos_bub() + tripoint( 3, 0, 0 );
+        here.ter_set( far, ter_t_floor );
+        here.build_map_cache( 0 );
+
+        guy.set_ai_danger( NPC_DANGER_VERY_LOW + 1 );
+        guy.set_moves( 100 );
+        auto result = guy.execute_need_goal( "seek_warmth" );
+        CHECK( result == npc::need_result::deferred );
+        CHECK( guy.get_warmth_plan().active() );
+    }
+
+    SECTION( "no warmth sources: impossible" ) {
+        here.build_map_cache( 0 );
+
+        guy.set_moves( 100 );
+        auto result = guy.execute_need_goal( "seek_warmth" );
+        CHECK( result == npc::need_result::impossible );
+    }
+
+    SECTION( "NPC holds position at shelter until warmth recovers" ) {
+        // Adjacent indoor tile; NPC can reach it in one step.
+        const tripoint_bub_ms shelter = guy.pos_bub() + point::east;
+        here.ter_set( shelter, ter_t_floor );
+        here.build_map_cache( 0 );
+
+        // First call: move into shelter.
+        guy.set_moves( 100 );
+        auto result = guy.execute_need_goal( "seek_warmth" );
+        REQUIRE( guy.pos_bub() == shelter );
+
+        // NPC is indoors but still freezing. Shelter drops from
+        // candidates (find_nearby_shelters returns empty indoors),
+        // but the executor should hold position and return progressed,
+        // not impossible, so follow/other goals don't pull the NPC out.
+        behavior::character_oracle_t oracle( &guy );
+        REQUIRE( oracle.needs_warmth_badly( "" ) == behavior::status_t::running );
+        guy.set_moves( 100 );
+        result = guy.execute_need_goal( "seek_warmth" );
+        // blocked (not progressed) so dispatch maps to npc_pause
+        // which consumes moves, avoiding zero-move spin.
+        CHECK( result == npc::need_result::blocked );
+        CHECK( guy.pos_bub() == shelter );
+    }
+
+    SECTION( "NPC at shelter switches to clothing when available" ) {
+        // NPC starts indoors (on floor tile) but still cold.
+        here.ter_set( guy.pos_bub(), ter_t_floor );
+        here.build_map_cache( 0 );
+
+        // No candidates: shelter empty (already indoors), no clothing.
+        // Executor should hold position (blocked, not progressed).
+        guy.set_moves( 100 );
+        auto result = guy.execute_need_goal( "seek_warmth" );
+        REQUIRE( result == npc::need_result::blocked );
+
+        // Now place distant clothing. The NPC should pursue it instead
+        // of staying stuck indoors.
+        const tripoint_bub_ms clothing = guy.pos_bub() + tripoint( 3, 0, 0 );
+        here.add_item_or_charges( clothing, item( itype_sweater ) );
+        here.build_map_cache( 0 );
+
+        guy.set_moves( 100 );
+        result = guy.execute_need_goal( "seek_warmth" );
+        CHECK( result == npc::need_result::progressed );
+        CHECK( guy.get_warmth_plan().active() );
+        CHECK( guy.get_warmth_plan().source_kind == need_source::ground_clothing );
+    }
+
+    SECTION( "clothing outranks shelter when clothing scores higher" ) {
+        // Shelter at distance 2 (score -2), clothing at distance 4 (warmth ~30).
+        // Clothing's warmth score beats shelter's negative-distance score.
+        const tripoint_bub_ms shelter = guy.pos_bub() + tripoint( 2, 0, 0 );
+        here.ter_set( shelter, ter_t_floor );
+        const tripoint_bub_ms clothing = guy.pos_bub() + tripoint( 4, 0, 0 );
+        here.add_item_or_charges( clothing, item( itype_sweater ) );
+        here.build_map_cache( 0 );
+
+        guy.set_moves( 100 );
+        auto result = guy.execute_need_goal( "seek_warmth" );
+        REQUIRE( result == npc::need_result::progressed );
+        CHECK( guy.get_warmth_plan().target == here.get_abs( clothing ) );
+        CHECK( guy.get_warmth_plan().source_kind == need_source::ground_clothing );
+    }
+
+    SECTION( "unreachable clothing times out then skips to second target" ) {
+        // First sweater behind glass (visible, unreachable without bashing).
+        const tripoint_bub_ms close = guy.pos_bub() + tripoint( 2, 0, 0 );
+        for( const point &d : {
+                 point::north, point::south, point::east, point::west,
+                 point( -1, -1 ), point( 1, -1 ), point( -1, 1 ), point( 1, 1 )
+             } ) {
+            here.ter_set( close + d, ter_t_wall_glass );
+        }
+        here.add_item_or_charges( close, item( itype_sweater ) );
+        // Second sweater in the open.
+        const tripoint_bub_ms far = guy.pos_bub() + tripoint( 0, -4, 0 );
+        here.add_item_or_charges( far, item( itype_sweater ) );
+        here.build_map_cache( 0 );
+
+        auto cands = guy.find_warmth_candidates();
+        REQUIRE( cands.size() >= 2 );
+
+        // 5-turn no-progress timeout on first target.
+        for( int turn = 0; turn < 5; ++turn ) {
+            guy.set_moves( 100 );
+            guy.execute_need_goal( "seek_warmth" );
+        }
+        REQUIRE( guy.get_warmth_plan().last_result == npc::need_result::impossible );
+
+        // Next call skips the failed target and picks the second one.
+        guy.set_moves( 100 );
+        auto result = guy.execute_need_goal( "seek_warmth" );
+        CHECK( guy.get_warmth_plan().active() );
+        CHECK( guy.get_warmth_plan().target == here.get_abs( far ) );
+        CHECK( result == npc::need_result::progressed );
+    }
+}
+
+// seek_warmth commitment lifecycle through npc::move().
+TEST_CASE( "npc_seek_warmth_commitment_lifecycle", "[npc][needs][warmth]" )
+{
+    clear_map_without_vision();
+    clear_avatar();
+    get_player_character().camps.clear();
+    get_player_character().setpos( get_map(), tripoint_bub_ms{ 50, 55, 0 } );
+    get_weather().forced_temperature = 20_C;
+    set_time_to_day();
+
+    npc &guy = spawn_npc( { 50, 50 }, "test_talker" );
+    clear_character( guy, true );
+    guy.set_fac( faction_your_followers );
+    guy.set_attitude( NPCATT_FOLLOW );
+    guy.set_stored_kcal( 55000 );
+    guy.set_hunger( 0 );
+    guy.set_thirst( 0 );
+    guy.set_all_parts_temp_conv( BODYTEMP_VERY_COLD );
+    guy.worn.wear_item( guy, item( itype_backpack ), false, false );
+    guy.rules.set_flag( ally_rule::allow_pick_up );
+
+    map &here = get_map();
+
+    SECTION( "commitment clears when warmth resolves" ) {
+        // Place distant clothing so seek_warmth activates.
+        const tripoint_bub_ms far = guy.pos_bub() + tripoint( 3, 0, 0 );
+        here.add_item_or_charges( far, item( itype_sweater ) );
+        here.build_map_cache( 0 );
+
+        guy.set_committed_goal( "seek_warmth" );
+        guy.set_moves( 100 );
+        guy.move();
+        REQUIRE( guy.get_committed_goal() == "seek_warmth" );
+
+        // Warm up the NPC so the predicate clears.
+        guy.set_all_parts_temp_conv( BODYTEMP_NORM );
+        guy.set_moves( 100 );
+        guy.move();
+        CHECK( guy.get_committed_goal() != "seek_warmth" );
+    }
+
+    SECTION( "stale impossible from prior cycle does not kill live commitment" ) {
+        // No warmth sources: executor returns impossible.
+        here.build_map_cache( 0 );
+        guy.set_committed_goal( "seek_warmth" );
+        guy.set_moves( 100 );
+        guy.move();
+        // Commitment should have cleared (impossible).
+        REQUIRE( guy.get_committed_goal() != "seek_warmth" );
+
+        // Now add a sweater to inventory and recommit.
+        guy.i_add( item( itype_sweater ) );
+        guy.set_committed_goal( "seek_warmth" );
+        guy.set_moves( 100 );
+        guy.move();
+        // The executor should have worn the sweater (progressed),
+        // and the commitment should still be alive because warmth
+        // is not yet resolved (still VERY_COLD).
+        CHECK( guy.is_wearing( itype_sweater ) );
+        behavior::character_oracle_t oracle( &guy );
+        if( oracle.needs_warmth_badly( "" ) == behavior::status_t::running ) {
+            CHECK( guy.get_committed_goal() == "seek_warmth" );
+        }
+    }
+
+    SECTION( "indoor hold does not produce zero-move spin" ) {
+        // NPC starts indoors, no warmth sources.
+        here.ter_set( guy.pos_bub(), ter_t_floor );
+        here.build_map_cache( 0 );
+
+        guy.set_committed_goal( "seek_warmth" );
+        const int moves_before = 100;
+        guy.set_moves( moves_before );
+        guy.move();
+        // The NPC should have consumed moves (not spun at 0).
+        CHECK( guy.get_moves() < moves_before );
+    }
+
+    SECTION( "cold NPC starting indoors without commitment stays put" ) {
+        // Fresh BT evaluation, no prior seek_warmth commitment.
+        // NPC is cold, indoors, no warmth sources. The BT should
+        // commit seek_warmth (predicate sees indoors-hold case),
+        // and the NPC should not leave shelter.
+        here.ter_set( guy.pos_bub(), ter_t_floor );
+        here.build_map_cache( 0 );
+        REQUIRE( guy.get_committed_goal().empty() );
+
+        const tripoint_bub_ms start = guy.pos_bub();
+        guy.set_moves( 100 );
+        guy.move();
+        // NPC should stay indoors, not follow player outside.
+        CHECK( guy.pos_bub() == start );
     }
 }
 

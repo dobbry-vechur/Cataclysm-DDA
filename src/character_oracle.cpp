@@ -171,6 +171,27 @@ status_t character_oracle_t::can_obtain_water( std::string_view ) const
     return status_t::failure;
 }
 
+status_t character_oracle_t::can_obtain_warmth( std::string_view ) const
+{
+    const npc *n = dynamic_cast<const npc *>( subject );
+    if( !n ) {
+        return status_t::failure;
+    }
+    // TODO: same const_cast caveat as can_obtain_food above.
+    // find_nearby_warm_clothing uses can_wear which is not const-qualified.
+    if( !const_cast<npc *>( n )->find_warmth_candidates().empty() ) {
+        return status_t::running;
+    }
+    // Already indoors with no other warmth sources: the executor will
+    // hold position until warmth recovers, so the predicate should
+    // still return running to prevent follow/duty from pulling the
+    // NPC back outside.
+    if( get_map().has_flag( ter_furn_flag::TFLAG_INDOORS, n->pos_bub() ) ) {
+        return status_t::running;
+    }
+    return status_t::failure;
+}
+
 status_t character_oracle_t::needs_sleep_badly( std::string_view ) const
 {
     // TIRED (191): low enough that off-shift NPCs go to bed early.

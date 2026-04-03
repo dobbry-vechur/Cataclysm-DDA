@@ -288,7 +288,8 @@ decision_category bt_goal_to_category( const std::string &goal )
         return decision_category::investigate;
     }
     if( goal == "drink_water" || goal == "eat_food" || goal == "go_to_sleep" ||
-        goal == "wear_warmer_clothes" || goal == "take_shelter" || goal == "start_fire" ) {
+        goal == "wear_warmer_clothes" || goal == "take_shelter" || goal == "start_fire" ||
+        goal == "seek_warmth" ) {
         return decision_category::needs;
     }
     if( goal == "follow_player" ) {
@@ -1742,6 +1743,23 @@ void npc::move()
                         ai_cache.water_plan.clear();
                         ai_cache.water_failed_targets.clear();
                     }
+                } else if( committed == "seek_warmth" ) {
+                    behavior::character_oracle_t oracle( this );
+                    bool satisfied = oracle.needs_warmth_badly( "" ) != behavior::status_t::running;
+                    bool exec_impossible = ai_cache.warmth_plan.last_result ==
+                                           need_result::impossible;
+                    completed_goal = satisfied || exec_impossible;
+                    if( completed_goal ) {
+                        ai_cache.warmth_plan.clear();
+                        ai_cache.warmth_failed_targets.clear();
+                    }
+                } else if( committed == "wear_warmer_clothes" ||
+                           committed == "take_shelter" ) {
+                    // Legacy warmth goals: no executor state to check.
+                    // Complete when warmth resolves or BT stops returning them.
+                    behavior::character_oracle_t oracle( this );
+                    bool satisfied = oracle.needs_warmth_badly( "" ) != behavior::status_t::running;
+                    completed_goal = satisfied || ( new_goal != committed );
                 } else if( committed == "camp_work" ) {
                     completed_goal = ( new_goal != "camp_work" );
                 } else if( committed == "return_to_camp" ) {
@@ -1763,6 +1781,11 @@ void npc::move()
                         } else if( committed == "drink_water" ) {
                             ai_cache.water_plan.clear();
                             ai_cache.water_failed_targets.clear();
+                        } else if( committed == "seek_warmth" ||
+                                   committed == "wear_warmer_clothes" ||
+                                   committed == "take_shelter" ) {
+                            ai_cache.warmth_plan.clear();
+                            ai_cache.warmth_failed_targets.clear();
                         }
                         committed = new_goal;
                     } else {
@@ -1817,7 +1840,8 @@ void npc::move()
                     // own fallback logic like lying_down on meth).
                     action = address_needs();
                 }
-            } else if( new_goal == "eat_food" || new_goal == "drink_water" ) {
+            } else if( new_goal == "eat_food" || new_goal == "drink_water" ||
+                       new_goal == "seek_warmth" ) {
                 const need_result result = execute_need_goal( new_goal );
                 if( result == need_result::progressed && activity ) {
                     // Undo attitude/mission change from assign_activity.
@@ -1829,6 +1853,15 @@ void npc::move()
                 } else if( result == need_result::satisfied ) {
                     action = npc_noop;
                 } else if( result == need_result::impossible ) {
+                    // Clear plan so stale last_result does not poison
+                    // the commitment check if this goal is recommitted.
+                    if( new_goal == "eat_food" ) {
+                        ai_cache.food_plan.clear();
+                    } else if( new_goal == "drink_water" ) {
+                        ai_cache.water_plan.clear();
+                    } else if( new_goal == "seek_warmth" ) {
+                        ai_cache.warmth_plan.clear();
+                    }
                     committed.clear();
                     action = npc_undecided;
                 } else {
@@ -1842,9 +1875,12 @@ void npc::move()
             }
 
             // Debug: executor state for needs goals.
-            if( new_goal == "eat_food" || new_goal == "drink_water" ) {
+            if( new_goal == "eat_food" || new_goal == "drink_water" ||
+                new_goal == "seek_warmth" ) {
                 const need_plan &np = ( new_goal == "eat_food" ) ?
-                                      ai_cache.food_plan : ai_cache.water_plan;
+                                      ai_cache.food_plan :
+                                      ( new_goal == "drink_water" ) ?
+                                      ai_cache.water_plan : ai_cache.warmth_plan;
                 static const std::array<const char *, 6> result_names = {{
                         "idle", "progressed", "satisfied", "blocked", "deferred", "impossible"
                     }
@@ -6282,9 +6318,9 @@ std::vector<npc::scored_item> npc::find_nearby_food( consume_filter filter )
 std::vector<npc::scored_item> npc::find_nearby_warm_clothing()
 {
     std::vector<scored_item> results;
-    if( is_player_ally() && !rules.has_flag( ally_rule::allow_pick_up ) ) {
-        return results;
-    }
+    // Note: allow_pick_up is not checked here. All callers wear clothing
+    // in place (via wear_item_at), not pick up for storage.
+    // NO_NPC_PICKUP zone and ownership filters below still apply.
     map &here = get_map();
 
     static const std::string locked_string( "LOCKED" );
@@ -6545,6 +6581,206 @@ std::vector<npc::need_candidate> npc::find_water_candidates()
     return candidates;
 }
 
+std::vector<npc::need_candidate> npc::find_warmth_candidates()
+{
+    std::vector<need_candidate> candidates;
+    map &here = get_map();
+
+    // Ground clothing items: scored by warmth value.
+    for( const scored_item &si : find_nearby_warm_clothing() ) {
+        candidates.push_back( {
+            need_source::ground_clothing,
+            here.get_abs( si.loc.pos_bub( here ) ),
+            si.score
+        } );
+    }
+
+    // Indoor shelter tiles: scored by negative distance. Nearby shelter
+    // (-1) can beat distant clothing, but clothing with positive warmth
+    // scores will generally outrank shelter. Adjacent clothing is
+    // consumed in step 1 before candidates are built, so it never
+    // competes here.
+    for( const scored_shelter &s : find_nearby_shelters() ) {
+        candidates.push_back( {
+            need_source::shelter,
+            here.get_abs( s.pos ),
+            -static_cast<float>( s.dist )
+        } );
+    }
+
+    // Sort descending by score so step 3 picks the best candidate.
+    std::sort( candidates.begin(), candidates.end(),
+    []( const need_candidate & a, const need_candidate & b ) {
+        return a.score > b.score;
+    } );
+
+    return candidates;
+}
+
+npc::need_result npc::execute_seek_warmth()
+{
+    const bool low_danger = ai_cache.danger <= NPC_DANGER_VERY_LOW;
+
+    need_plan &plan = ai_cache.warmth_plan;
+    std::set<tripoint_abs_ms> &failed = ai_cache.warmth_failed_targets;
+    map &here = get_map();
+
+    // Helper: check if warmth need is resolved after an action.
+    const auto warmth_resolved = [this]() -> bool {
+        behavior::character_oracle_t oracle( this );
+        return oracle.needs_warmth_badly( "" ) != behavior::status_t::running;
+    };
+
+    // 1. Immediate responses (no danger gate):
+    //    inventory wear, then adjacent ground clothing.
+    //    These return progressed (not satisfied) because wearing one
+    //    item may not resolve the cold. Only return satisfied when
+    //    the warmth predicate clears.
+    if( wear_warmest_item() ) {
+        // Reset plan state so stale impossible / accumulated no_progress
+        // from a prior target do not poison the commitment or timeout.
+        plan.last_result = need_result::progressed;
+        plan.no_progress_turns = 0;
+        if( warmth_resolved() ) {
+            plan.clear();
+            failed.clear();
+            return need_result::satisfied;
+        }
+        return need_result::progressed;
+    }
+    for( scored_item &c : find_nearby_warm_clothing() ) {
+        if( square_dist( pos_bub(), c.loc.pos_bub( here ) ) <= 1 ) {
+            if( wear_item_at( c.loc ) ) {
+                plan.last_result = need_result::progressed;
+                plan.no_progress_turns = 0;
+                if( warmth_resolved() ) {
+                    plan.clear();
+                    failed.clear();
+                    return need_result::satisfied;
+                }
+                return need_result::progressed;
+            }
+        }
+    }
+
+    using need_source = npc_short_term_cache::need_source;
+
+    const auto candidates = find_warmth_candidates();
+
+    // 2. Validate existing target against the candidate scan.
+    if( plan.active() ) {
+        bool still_valid = false;
+        for( const need_candidate &c : candidates ) {
+            if( c.target == plan.target && c.source_kind == plan.source_kind ) {
+                still_valid = true;
+                break;
+            }
+        }
+        if( !still_valid ) {
+            plan.clear();
+        }
+    }
+
+    // 3. Acquire target from scored candidates, skipping failed targets.
+    if( !plan.active() && !candidates.empty() ) {
+        for( const need_candidate &c : candidates ) {
+            if( failed.count( c.target ) == 0 ) {
+                plan.goal = "seek_warmth";
+                plan.source_kind = c.source_kind;
+                plan.target = c.target;
+                plan.last_result = need_result::idle;
+                plan.no_progress_turns = 0;
+                break;
+            }
+        }
+        if( !plan.active() ) {
+            failed.clear();
+        }
+    }
+    if( !plan.active() ) {
+        // No candidates and no plan. If the NPC is already indoors and
+        // still cold, hold position so follow/other goals don't pull
+        // them back outside before warmth recovers. If outdoors or warm,
+        // give up normally.
+        if( here.has_flag( ter_furn_flag::TFLAG_INDOORS, pos_bub() ) &&
+            !warmth_resolved() ) {
+            // Hold position indoors until warmth recovers. No timeout:
+            // leaving shelter into worse cold is not a useful fallback.
+            // The BT priority system handles genuine interrupts (combat),
+            // and the commitment clears when needs_warmth_badly() resolves.
+            plan.last_result = need_result::blocked;
+            return need_result::blocked;
+        }
+        plan.clear();
+        plan.last_result = need_result::impossible;
+        return need_result::impossible;
+    }
+
+    // 4. Execute based on source kind. All movement is behind the danger gate.
+    const tripoint_bub_ms target_bub = here.get_bub( plan.target );
+
+    if( plan.source_kind == need_source::ground_clothing ) {
+        if( square_dist( pos_bub(), target_bub ) <= 1 ) {
+            for( scored_item &c : find_nearby_warm_clothing() ) {
+                if( here.get_abs( c.loc.pos_bub( here ) ) == plan.target &&
+                    wear_item_at( c.loc ) ) {
+                    plan.last_result = need_result::progressed;
+                    plan.no_progress_turns = 0;
+                    if( warmth_resolved() ) {
+                        plan.clear();
+                        failed.clear();
+                        return need_result::satisfied;
+                    }
+                    return need_result::progressed;
+                }
+            }
+        } else if( low_danger && move_to_and_verify( target_bub, true ) ) {
+            plan.last_result = need_result::progressed;
+            plan.no_progress_turns = 0;
+            return need_result::progressed;
+        }
+    } else if( plan.source_kind == need_source::shelter ) {
+        if( low_danger ) {
+            if( square_dist( pos_bub(), target_bub ) <= 1 ) {
+                move_to( target_bub );
+                if( pos_bub() == target_bub ) {
+                    plan.last_result = need_result::progressed;
+                    plan.no_progress_turns = 0;
+                    if( warmth_resolved() ) {
+                        plan.clear();
+                        failed.clear();
+                        return need_result::satisfied;
+                    }
+                    return need_result::progressed;
+                }
+            } else if( move_to_and_verify( target_bub, true ) ) {
+                plan.last_result = need_result::progressed;
+                plan.no_progress_turns = 0;
+                return need_result::progressed;
+            }
+        } else {
+            // Danger blocked movement. Don't blacklist; defer.
+            plan.last_result = need_result::deferred;
+            return need_result::deferred;
+        }
+    }
+
+    // 5. No progress this turn.
+    if( !low_danger && square_dist( pos_bub(), target_bub ) > 1 ) {
+        plan.last_result = need_result::deferred;
+        return need_result::deferred;
+    }
+    plan.no_progress_turns++;
+    if( plan.no_progress_turns >= 5 ) {
+        failed.insert( plan.target );
+        plan.clear();
+        plan.last_result = need_result::impossible;
+        return need_result::impossible;
+    }
+    plan.last_result = need_result::blocked;
+    return need_result::blocked;
+}
+
 npc::need_result npc::execute_need_goal( const std::string &goal )
 {
     if( goal == "eat_food" ) {
@@ -6552,6 +6788,9 @@ npc::need_result npc::execute_need_goal( const std::string &goal )
     }
     if( goal == "drink_water" ) {
         return execute_drink_water();
+    }
+    if( goal == "seek_warmth" ) {
+        return execute_seek_warmth();
     }
     return need_result::idle;
 }

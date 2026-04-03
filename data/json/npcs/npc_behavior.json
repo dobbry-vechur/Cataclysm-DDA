@@ -80,8 +80,14 @@
     "id": "npc_homeostasis",
     "strategy": "fallback",
     "conditions": [ { "predicate": "npc_needs_warmth_badly" } ],
-    "children": [ "npc_wear_warmer_clothes", "npc_get_warm" ],
+    "children": [ "npc_obtain_warmth", "npc_wear_warmer_clothes", "npc_get_warm" ],
     "score": "npc_warmth_urgency"
+  },
+  {
+    "type": "behavior",
+    "id": "npc_obtain_warmth",
+    "conditions": [ { "predicate": "npc_can_obtain_warmth" } ],
+    "goal": "seek_warmth"
   },
   {
     "type": "behavior",
