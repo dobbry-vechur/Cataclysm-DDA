@@ -41,13 +41,7 @@ env:
   BACKTRACE: 1
   # Compressed size ~1GB based on observations
   CCACHE_LIMIT: 10GB
-  # Dev Drive mount point (ReFS + Defender perf mode). Created by setup-dev-drive step.
-  CDDA_DD_WORKSPACE: "C:\\devdrive\\Cataclysm-DDA"
-  CDDA_CCACHE_PATH: "C:\\devdrive\\Cataclysm-DDA\\ccache\\"
   CDDA_USE_CCACHE: true
-  # Force ccache cache dir onto Dev Drive (defaults to %APPDATA%\ccache on C:).
-  CCACHE_DIR: "C:\\devdrive\\ccache-cache"
-  VCPKG_OVERLAY_TRIPLETS: "C:\\devdrive\\Cataclysm-DDA\\.github\\vcpkg_triplets"
   # Also conveniently disable ccache internal compression
   CCACHE_HARDLINK: true
   ZSTD_CLEVEL: 17
@@ -57,9 +51,6 @@ jobs:
     name: Build
     runs-on: windows-2022
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
-    defaults:
-      run:
-        working-directory: "C:\\devdrive\\Cataclysm-DDA"
 
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -69,11 +60,17 @@ jobs:
     - name: Setup Dev Drive
       uses: samypr100/setup-dev-drive@30f0f98ae5636b2b6501e181dfb3631b9974818d # v4.0.0
       with:
-        drive-size: "12GB"
+        drive-size: "14GB"
         drive-format: "ReFS"
         drive-type: "Dynamic"
-        mount-path: "C:\\devdrive"
         workspace-copy: true
+
+    - name: Pin Dev Drive paths to env
+      run: |
+        echo "CDDA_DD_WORKSPACE=$env:DEV_DRIVE\Cataclysm-DDA" >> $env:GITHUB_ENV
+        echo "CDDA_CCACHE_PATH=$env:DEV_DRIVE\Cataclysm-DDA\ccache\" >> $env:GITHUB_ENV
+        echo "CCACHE_DIR=$env:DEV_DRIVE\ccache-cache" >> $env:GITHUB_ENV
+        echo "VCPKG_OVERLAY_TRIPLETS=$env:DEV_DRIVE\Cataclysm-DDA\.github\vcpkg_triplets" >> $env:GITHUB_ENV
 
     - name: Setup msys2
       uses: msys2/setup-msys2@4f806de0a5a7294ffabaff804b38a9b435a73bda # v2
@@ -102,17 +99,17 @@ jobs:
       uses: lukka/run-vcpkg@7d259227a1fb6471a0253dd5ab7419835228f7d7 # v11
       id: runvcpkg
       with:
-        vcpkgDirectory: 'C:\devdrive\vcpkg'
+        vcpkgDirectory: 'D:\vcpkg'
         vcpkgGitCommitId: '1b6e030cf096faf4f82d7b7025de8b2abee3e3df'
 
     - name: Integrate vcpkg
       run: |
-        vcpkg integrate install --vcpkg-root "C:\devdrive\vcpkg"
+        vcpkg integrate install --vcpkg-root "D:\vcpkg"
 
     - name: Cache vcpkg installed packages
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
-        path: C:\devdrive\Cataclysm-DDA\msvc-full-features\vcpkg_installed
+        path: ${{ env.DEV_DRIVE }}\Cataclysm-DDA\msvc-full-features\vcpkg_installed
         key: vcpkg-installed-${{ hashFiles('msvc-full-features/vcpkg.json', '.github/vcpkg_triplets/x64-windows-static.cmake') }}-1b6e030cf096faf4f82d7b7025de8b2abee3e3df
 
     - name: Download ccache
@@ -121,10 +118,11 @@ jobs:
         repository: 'ccache/ccache'
         tag: 'v4.6.1'
         fileName: 'ccache-4.6.1-windows-x86_64.zip'
-        out-file-path: 'C:\devdrive\Cataclysm-DDA'
+        out-file-path: ${{ env.DEV_DRIVE }}\Cataclysm-DDA
 
     - name: Install ccache
       id: install-ccache
+      working-directory: ${{ env.CDDA_DD_WORKSPACE }}
       run: |
         unzip ccache-4.6.1-windows-x86_64.zip
         cp ccache-4.6.1-windows-x86_64/ccache.exe ccache-4.6.1-windows-x86_64/cl.exe
@@ -136,7 +134,7 @@ jobs:
       run: |
         echo "datetime=$(/bin/date -u "+%Y%m%d%H%M")" >> $GITHUB_OUTPUT
         echo "datetime-seconds=$(/bin/date +%s)" >> $GITHUB_OUTPUT
-        echo "ccache-path=C:\\devdrive\\ccache-cache" >> $GITHUB_OUTPUT
+        echo "ccache-path=${CCACHE_DIR}" >> $GITHUB_OUTPUT
       shell: bash
 
     - name: ccache cache files
@@ -155,11 +153,13 @@ jobs:
         & "$env:CDDA_CCACHE_PATH\ccache.exe" -z
 
     - name: Symlink intermediates onto Dev Drive
+      working-directory: ${{ env.CDDA_DD_WORKSPACE }}
       run: |
-        mkdir -p "C:\devdrive\objwin"
-        New-Item -ItemType SymbolicLink -Target "C:\devdrive\objwin" objwin
+        mkdir -p "$env:DEV_DRIVE\objwin"
+        New-Item -ItemType SymbolicLink -Target "$env:DEV_DRIVE\objwin" objwin
 
     - name: Build
+      working-directory: ${{ env.CDDA_DD_WORKSPACE }}
       run: |
           msbuild -m -p:Configuration=Release -p:Platform=x64 "-target:Cataclysm-vcpkg-static;Cataclysm-test-vcpkg-static;JsonFormatter-vcpkg-static;zzip" msvc-full-features/Cataclysm-vcpkg-static.sln
 
@@ -194,9 +194,9 @@ jobs:
       if: failure()
       run: |
         echo =================================================
-        Get-ChildItem "C:\devdrive\Cataclysm-DDA\msvc-full-features\vcpkg_installed" -Recurse
+        Get-ChildItem "$env:CDDA_DD_WORKSPACE\msvc-full-features\vcpkg_installed" -Recurse
         echo =================================================
-        Get-ChildItem "C:\devdrive\vcpkg\buildtrees" |
+        Get-ChildItem "D:\vcpkg\buildtrees" |
         Foreach-Object {
             Get-ChildItem $_.FullName -Filter *.log |
             Foreach-Object {
@@ -209,6 +209,7 @@ jobs:
 
     - name: Compile .mo files for localization
       if: ${{ github.ref_name != 'master' }}
+      working-directory: ${{ env.CDDA_DD_WORKSPACE }}
       shell: msys2 {0}
       run: |
           make -C lang -j2
@@ -223,11 +224,13 @@ jobs:
 
     - name: Run tests
       if: ${{ github.ref_name != 'master' }}
+      working-directory: ${{ env.CDDA_DD_WORKSPACE }}
       run: |
           .\Cataclysm-test-vcpkg-static-Release-x64.exe --min-duration 20 --rng-seed time --order lex --wait-for-keypress exit
 
     - name: Dump disk usage logs if job failed
       if: failure()
+      working-directory: ${{ env.CDDA_DD_WORKSPACE }}
       run: |
         echo =================================================
         df
