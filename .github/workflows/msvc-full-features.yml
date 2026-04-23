@@ -42,13 +42,13 @@ env:
   # Compressed size ~1GB based on observations
   CCACHE_LIMIT: 10GB
   # Dev Drive mount point (ReFS + Defender perf mode). Created by setup-dev-drive step.
-  DEV_DRIVE: V:
-  CDDA_DD_WORKSPACE: V:\Cataclysm-DDA
-  CDDA_CCACHE_PATH: V:\Cataclysm-DDA\ccache\
+  DEV_DRIVE: "V:"
+  CDDA_DD_WORKSPACE: "V:\\Cataclysm-DDA"
+  CDDA_CCACHE_PATH: "V:\\Cataclysm-DDA\\ccache\\"
   CDDA_USE_CCACHE: true
   # Force ccache cache dir onto Dev Drive (defaults to %APPDATA%\ccache on C:).
-  CCACHE_DIR: V:\ccache-cache
-  VCPKG_OVERLAY_TRIPLETS: V:\Cataclysm-DDA\.github\vcpkg_triplets
+  CCACHE_DIR: "V:\\ccache-cache"
+  VCPKG_OVERLAY_TRIPLETS: "V:\\Cataclysm-DDA\\.github\\vcpkg_triplets"
   # Also conveniently disable ccache internal compression
   CCACHE_HARDLINK: true
   ZSTD_CLEVEL: 17
@@ -60,7 +60,7 @@ jobs:
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
     defaults:
       run:
-        working-directory: V:\Cataclysm-DDA
+        working-directory: "V:\\Cataclysm-DDA"
 
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
