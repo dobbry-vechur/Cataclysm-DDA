@@ -41,12 +41,14 @@ env:
   BACKTRACE: 1
   # Compressed size ~1GB based on observations
   CCACHE_LIMIT: 10GB
-  CDDA_CCACHE_PATH: ${{ github.workspace }}\ccache\
+  # Dev Drive mount point (ReFS + Defender perf mode). Created by setup-dev-drive step.
+  DEV_DRIVE: V:
+  CDDA_DD_WORKSPACE: V:\Cataclysm-DDA
+  CDDA_CCACHE_PATH: V:\Cataclysm-DDA\ccache\
   CDDA_USE_CCACHE: true
-  # There's not enough disk space to build both release and debug versions of
-  # our dependencies, so we hack the triplet file to build only release versions
-  # Have to use github.workspace because runner namespace isn't available yet.
-  VCPKG_OVERLAY_TRIPLETS: ${{ github.workspace }}\.github\vcpkg_triplets
+  # Force ccache cache dir onto Dev Drive (defaults to %APPDATA%\ccache on C:).
+  CCACHE_DIR: V:\ccache-cache
+  VCPKG_OVERLAY_TRIPLETS: V:\Cataclysm-DDA\.github\vcpkg_triplets
   # Also conveniently disable ccache internal compression
   CCACHE_HARDLINK: true
   ZSTD_CLEVEL: 17
@@ -56,11 +58,23 @@ jobs:
     name: Build
     runs-on: windows-2022
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
+    defaults:
+      run:
+        working-directory: V:\Cataclysm-DDA
 
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       with:
         persist-credentials: false
+
+    - name: Setup Dev Drive
+      uses: samypr100/setup-dev-drive@30f0f98ae5636b2b6501e181dfb3631b9974818d # v4.0.0
+      with:
+        drive-size: "12GB"
+        drive-format: "ReFS"
+        drive-type: "Dynamic"
+        mount-path: "V:"
+        workspace-copy: true
 
     - name: Setup msys2
       uses: msys2/setup-msys2@4f806de0a5a7294ffabaff804b38a9b435a73bda # v2
@@ -89,19 +103,17 @@ jobs:
       uses: lukka/run-vcpkg@7d259227a1fb6471a0253dd5ab7419835228f7d7 # v11
       id: runvcpkg
       with:
-        vcpkgDirectory: '${{ runner.workspace }}/b/vcpkg'
+        vcpkgDirectory: 'V:\vcpkg'
         vcpkgGitCommitId: '1b6e030cf096faf4f82d7b7025de8b2abee3e3df'
 
     - name: Integrate vcpkg
       run: |
-        vcpkg integrate install --vcpkg-root "$env:RUNNER_WORKSPACE\b\vcpkg"
-      env:
-        RUNNER_WORKSPACE: ${{ runner.workspace }}
+        vcpkg integrate install --vcpkg-root "V:\vcpkg"
 
     - name: Cache vcpkg installed packages
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
-        path: msvc-full-features/vcpkg_installed
+        path: V:\Cataclysm-DDA\msvc-full-features\vcpkg_installed
         key: vcpkg-installed-${{ hashFiles('msvc-full-features/vcpkg.json', '.github/vcpkg_triplets/x64-windows-static.cmake') }}-1b6e030cf096faf4f82d7b7025de8b2abee3e3df
 
     - name: Download ccache
@@ -110,6 +122,7 @@ jobs:
         repository: 'ccache/ccache'
         tag: 'v4.6.1'
         fileName: 'ccache-4.6.1-windows-x86_64.zip'
+        out-file-path: 'V:\Cataclysm-DDA'
 
     - name: Install ccache
       id: install-ccache
@@ -124,7 +137,7 @@ jobs:
       run: |
         echo "datetime=$(/bin/date -u "+%Y%m%d%H%M")" >> $GITHUB_OUTPUT
         echo "datetime-seconds=$(/bin/date +%s)" >> $GITHUB_OUTPUT
-        echo "ccache-path=$(echo "$APPDATA\\ccache")" >> $GITHUB_OUTPUT
+        echo "ccache-path=V:\\ccache-cache" >> $GITHUB_OUTPUT
       shell: bash
 
     - name: ccache cache files
@@ -142,10 +155,10 @@ jobs:
         & "$env:CDDA_CCACHE_PATH\ccache.exe" -s -v
         & "$env:CDDA_CCACHE_PATH\ccache.exe" -z
 
-    - name: Symlink intermediates to C
+    - name: Symlink intermediates onto Dev Drive
       run: |
-        mkdir -p "$env:TEMP\objwin"
-        New-Item -ItemType SymbolicLink -Target "$env:TEMP\objwin" objwin
+        mkdir -p "V:\objwin"
+        New-Item -ItemType SymbolicLink -Target "V:\objwin" objwin
 
     - name: Build
       run: |
@@ -182,9 +195,9 @@ jobs:
       if: failure()
       run: |
         echo =================================================
-        Get-ChildItem "$env:RUNNER_WORKSPACE/Cataclysm-DDA/msvc-full-features/vcpkg_installed" -Recurse
+        Get-ChildItem "V:\Cataclysm-DDA\msvc-full-features\vcpkg_installed" -Recurse
         echo =================================================
-        Get-ChildItem "$env:RUNNER_WORKSPACE/b/vcpkg/buildtrees" |
+        Get-ChildItem "V:\vcpkg\buildtrees" |
         Foreach-Object {
             Get-ChildItem $_.FullName -Filter *.log |
             Foreach-Object {
@@ -194,8 +207,6 @@ jobs:
               type $_.FullName
             }
         }
-      env:
-        RUNNER_WORKSPACE: ${{ runner.workspace }}
 
     - name: Compile .mo files for localization
       if: ${{ github.ref_name != 'master' }}
