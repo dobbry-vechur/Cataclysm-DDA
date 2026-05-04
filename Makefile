@@ -1005,9 +1005,18 @@ ifeq ($(TARGETSYSTEM),LINUX)
   CXXFLAGS += -mcx16
   BINDIST_EXTRAS += cataclysm-launcher
   ifneq ("$(wildcard LICENSE-SDL.txt)","")
-    SDL2_solib = $(shell ldd $(TARGET) | grep libSDL2-2\.0 | cut -d ' ' -f 3)
-    INSTALL_EXTRAS += $(SDL2_solib)
+    ifeq ($(SDL3),1)
+      SDL_solibs = $(shell ldd $(TARGET) | awk '/libSDL3/ {print $$3}')
+    else
+      SDL_solibs = $(shell ldd $(TARGET) | grep libSDL2-2\.0 | cut -d ' ' -f 3)
+    endif
+    INSTALL_EXTRAS += $(SDL_solibs)
     BINDIST_EXTRAS += LICENSE-SDL.txt
+    ifeq ($(SDL3),1)
+      ifneq ("$(wildcard LICENSE-SDL3_mixer.txt)","")
+        BINDIST_EXTRAS += LICENSE-SDL3_mixer.txt
+      endif
+    endif
   endif
   ifeq ($(BACKTRACE),1)
     # -rdynamic needed for symbols in backtraces
