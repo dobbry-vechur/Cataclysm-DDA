@@ -1455,7 +1455,7 @@ endif  # ifeq ($(NATIVE), osx)
 $(BINDIST): distclean version $(TARGET) $(ZZIP_BIN) $(L10N) $(BINDIST_EXTRAS) $(BINDIST_LOCALE)
 	mkdir -p $(BINDIST_DIR)
 	cp -R $(TARGET) $(ZZIP_BIN) $(BINDIST_EXTRAS) $(BINDIST_DIR)
-	$(foreach lib,$(INSTALL_EXTRAS), install --strip $(lib) $(BINDIST_DIR))
+	$(foreach lib,$(INSTALL_EXTRAS),install --strip $(lib) $(BINDIST_DIR);)
 ifdef LANGUAGES
 	cp -R --parents lang/mo $(BINDIST_DIR)
 endif
