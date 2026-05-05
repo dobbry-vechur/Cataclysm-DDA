@@ -379,7 +379,7 @@ jobs:
               -DBUILD_SHARED_LIBS=ON
           cmake --build sdl3_build -j$(sysctl -n hw.ncpu)
           cmake --install sdl3_build
-          git clone --depth 1 --branch release-3.4.2 https://github.com/libsdl-org/SDL_image.git sdl3_image_src
+          git clone --depth 1 --branch release-3.4.2 --recurse-submodules --shallow-submodules https://github.com/libsdl-org/SDL_image.git sdl3_image_src
           cmake -S sdl3_image_src -B sdl3_image_build "$ARCH_ARG" \
               -DCMAKE_BUILD_TYPE=Release \
               -DCMAKE_INSTALL_PREFIX=$PREFIX \
@@ -387,7 +387,7 @@ jobs:
               -DBUILD_SHARED_LIBS=ON
           cmake --build sdl3_image_build -j$(sysctl -n hw.ncpu)
           cmake --install sdl3_image_build
-          git clone --depth 1 --branch release-3.2.2 https://github.com/libsdl-org/SDL_ttf.git sdl3_ttf_src
+          git clone --depth 1 --branch release-3.2.2 --recurse-submodules --shallow-submodules https://github.com/libsdl-org/SDL_ttf.git sdl3_ttf_src
           cmake -S sdl3_ttf_src -B sdl3_ttf_build "$ARCH_ARG" \
               -DCMAKE_BUILD_TYPE=Release \
               -DCMAKE_INSTALL_PREFIX=$PREFIX \
@@ -395,7 +395,7 @@ jobs:
               -DBUILD_SHARED_LIBS=ON
           cmake --build sdl3_ttf_build -j$(sysctl -n hw.ncpu)
           cmake --install sdl3_ttf_build
-          git clone --depth 1 --branch release-3.2.0 https://github.com/libsdl-org/SDL_mixer.git sdl3_mixer_src
+          git clone --depth 1 --branch release-3.2.0 --recurse-submodules --shallow-submodules https://github.com/libsdl-org/SDL_mixer.git sdl3_mixer_src
           cmake -S sdl3_mixer_src -B sdl3_mixer_build "$ARCH_ARG" \
               -DCMAKE_BUILD_TYPE=Release \
               -DCMAKE_INSTALL_PREFIX=$PREFIX \
