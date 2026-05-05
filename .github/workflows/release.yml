@@ -277,7 +277,7 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ runner.workspace }}/sdl3_prefix
-          key: sdl3-stack-sdl-3.4.4-image-3.4.2-ttf-3.2.2-mixer-3.2.0-${{ runner.os }}-v1
+          key: sdl3-stack-sdl-3.4.4-image-3.4.2-ttf-3.2.2-mixer-3.2.0-${{ runner.os }}-v2
       - name: Build SDL3 stack from source (Linux, SDL3)
         if: runner.os == 'Linux' && matrix.android == 'none' && !matrix.wasm && matrix.sdl3 == 1 && steps.cache-sdl3-release.outputs.cache-hit != 'true'
         run: |
