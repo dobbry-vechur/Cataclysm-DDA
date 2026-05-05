@@ -358,7 +358,9 @@ jobs:
         if: runner.os == 'macOS' && matrix.tiles == 1 && matrix.sdl3 == 1
         run: |
           sudo port install SDL3 +universal SDL3_image +universal SDL3_ttf +universal SDL3_mixer +universal \
-              freetype +universal pkgconfig +universal
+              freetype +universal pkgconfig +universal \
+            || sudo port -s install SDL3 +universal SDL3_image +universal SDL3_ttf +universal SDL3_mixer +universal \
+                  freetype +universal pkgconfig +universal
       - name: Create VERSION.TXT
         shell: bash
         run: |
