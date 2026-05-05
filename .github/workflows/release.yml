@@ -357,10 +357,61 @@ jobs:
       - name: install macports packages (mac, SDL3)
         if: runner.os == 'macOS' && matrix.tiles == 1 && matrix.sdl3 == 1
         run: |
-          sudo port install SDL3 +universal SDL3_image +universal SDL3_ttf +universal SDL3_mixer +universal \
-              freetype +universal pkgconfig +universal \
-            || sudo port -s install SDL3 +universal SDL3_image +universal SDL3_ttf +universal SDL3_mixer +universal \
-                  freetype +universal pkgconfig +universal
+          sudo port install freetype +universal pkgconfig +universal
+      - name: Cache SDL3 stack source build (mac, SDL3)
+        if: runner.os == 'macOS' && matrix.tiles == 1 && matrix.sdl3 == 1
+        id: cache-sdl3-release-macos
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.workspace }}/sdl3_prefix
+          key: sdl3-stack-universal-sdl-3.4.4-image-3.4.2-ttf-3.2.2-mixer-3.2.0-${{ runner.os }}-v1
+      - name: Build SDL3 stack from source (mac, SDL3, universal)
+        if: runner.os == 'macOS' && matrix.tiles == 1 && matrix.sdl3 == 1 && steps.cache-sdl3-release-macos.outputs.cache-hit != 'true'
+        run: |
+          PREFIX=${{ runner.workspace }}/sdl3_prefix
+          export PKG_CONFIG_PATH=$PREFIX/lib/pkgconfig:/opt/local/lib/pkgconfig
+          export CMAKE_PREFIX_PATH=$PREFIX
+          ARCH_ARG='-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64'
+          git clone --depth 1 --branch release-3.4.4 https://github.com/libsdl-org/SDL.git sdl3_src
+          cmake -S sdl3_src -B sdl3_build "$ARCH_ARG" \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_INSTALL_PREFIX=$PREFIX \
+              -DBUILD_SHARED_LIBS=ON
+          cmake --build sdl3_build -j$(sysctl -n hw.ncpu)
+          cmake --install sdl3_build
+          git clone --depth 1 --branch release-3.4.2 https://github.com/libsdl-org/SDL_image.git sdl3_image_src
+          cmake -S sdl3_image_src -B sdl3_image_build "$ARCH_ARG" \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_INSTALL_PREFIX=$PREFIX \
+              -DSDLIMAGE_VENDORED=ON \
+              -DBUILD_SHARED_LIBS=ON
+          cmake --build sdl3_image_build -j$(sysctl -n hw.ncpu)
+          cmake --install sdl3_image_build
+          git clone --depth 1 --branch release-3.2.2 https://github.com/libsdl-org/SDL_ttf.git sdl3_ttf_src
+          cmake -S sdl3_ttf_src -B sdl3_ttf_build "$ARCH_ARG" \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_INSTALL_PREFIX=$PREFIX \
+              -DSDLTTF_VENDORED=ON \
+              -DBUILD_SHARED_LIBS=ON
+          cmake --build sdl3_ttf_build -j$(sysctl -n hw.ncpu)
+          cmake --install sdl3_ttf_build
+          git clone --depth 1 --branch release-3.2.0 https://github.com/libsdl-org/SDL_mixer.git sdl3_mixer_src
+          cmake -S sdl3_mixer_src -B sdl3_mixer_build "$ARCH_ARG" \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_INSTALL_PREFIX=$PREFIX \
+              -DSDLMIXER_VENDORED=ON \
+              -DSDLMIXER_OPUS=OFF -DSDLMIXER_MOD=OFF -DSDLMIXER_MIDI=OFF \
+              -DBUILD_SHARED_LIBS=ON
+          cmake --build sdl3_mixer_build -j$(sysctl -n hw.ncpu)
+          cmake --install sdl3_mixer_build
+          mkdir -p $PREFIX/share
+          cp sdl3_src/LICENSE.txt $PREFIX/share/LICENSE-SDL.txt
+          cp sdl3_mixer_src/LICENSE.txt $PREFIX/share/LICENSE-SDL3_mixer.txt
+      - name: Stage SDL3 license files (mac, SDL3)
+        if: runner.os == 'macOS' && matrix.tiles == 1 && matrix.sdl3 == 1
+        run: |
+          cp ${{ runner.workspace }}/sdl3_prefix/share/LICENSE-SDL.txt ${{ github.workspace }}/LICENSE-SDL.txt
+          cp ${{ runner.workspace }}/sdl3_prefix/share/LICENSE-SDL3_mixer.txt ${{ github.workspace }}/LICENSE-SDL3_mixer.txt
       - name: Create VERSION.TXT
         shell: bash
         run: |
@@ -431,7 +482,7 @@ jobs:
       - name: Build CDDA (osx, SDL3)
         if: runner.os == 'macOS' && matrix.sdl3 == 1
         env:
-          PKG_CONFIG_PATH: /opt/local/lib/pkgconfig
+          PKG_CONFIG_PATH: ${{ runner.workspace }}/sdl3_prefix/lib/pkgconfig:/opt/local/lib/pkgconfig
         run: |
           make -j3 TILES=${{ matrix.tiles }} SOUND=${{ matrix.tiles }} SDL3=1 RELEASE=1 LOCALIZE=1 LANGUAGES=all BACKTRACE=0 PCH=0 USE_HOME_DIR=1 UNIVERSAL_BINARY=1 WARN_STALE_DATA=1 dmgdist
           mv Cataclysm.dmg cdda-${{ matrix.artifact }}-${{ needs.release.outputs.timestamp }}.dmg
