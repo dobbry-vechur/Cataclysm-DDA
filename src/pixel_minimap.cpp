@@ -35,6 +35,7 @@
 #include "mtype.h"
 #include "pixel_minimap_projectors.h"
 #include "sdl_utils.h"
+#include "sdltiles.h"
 #include "type_id.h"
 #include "vehicle.h"
 #include "viewer.h"
@@ -266,7 +267,11 @@ void pixel_minimap::flush_cache_updates()
             continue;
         }
 
-        scoped_render_target chunk_scope( renderer, mcp.second.chunk_tex.get() );
+        scoped_render_target chunk_scope( renderer, mcp.second.chunk_tex.get()
+#if SDL_MAJOR_VERSION >= 3
+                                          , get_shared_variant_pass()
+#endif
+                                        );
         if( !chunk_scope.is_valid() ) {
             if( !chunk_scope.boundary_intact() ) {
                 // Boundary lost: latch so the enclosing dtor skips detach.
@@ -461,7 +466,11 @@ void pixel_minimap::reset()
 
 void pixel_minimap::render( const tripoint_bub_ms &center )
 {
-    scoped_render_target main_scope( renderer, main_tex.get() );
+    scoped_render_target main_scope( renderer, main_tex.get()
+#if SDL_MAJOR_VERSION >= 3
+                                     , get_shared_variant_pass()
+#endif
+                                   );
     if( !main_scope.is_valid() ) {
         if( !main_scope.boundary_intact() ) {
             display_buffer_scope_signal_recovery_required();
