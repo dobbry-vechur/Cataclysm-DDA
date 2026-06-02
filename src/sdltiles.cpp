@@ -691,23 +691,82 @@ static int preview_terminal_width = -1;
 static int preview_terminal_height = -1;
 static uint32_t preview_terminal_change_time = 0;
 
-extern "C" {
+// onNativeVisibleDisplayFrameChanged fires from the android UI thread (a
+// ViewTreeObserver layout listener); refresh and CheckMessages read on the SDL
+// game-loop thread. A seqlock over per-field atomics hands the reader a torn-free
+// snapshot lock-free; one serialized writer makes the odd/even sequence
+// sufficient. Only the vendored SDL2 activity registers the listener; the SDL3
+// AAR reports insets through onNativeInsetsChanged instead, so under SDL3 the
+// inbox stays empty and the keyboard-screen-scale clamp is inert.
+struct android_visible_frame_inbox {
+    std::atomic<uint32_t> seq{ 0 };
+    std::atomic<int> x{ 0 };
+    std::atomic<int> y{ 0 };
+    std::atomic<int> w{ 0 };
+    std::atomic<int> h{ 0 };
+    std::atomic<bool> valid{ false };
 
-    static bool visible_display_frame_dirty = false;
-    static bool has_visible_display_frame = false;
-    static SDL_Rect visible_display_frame;
+    void publish( int left, int top, int right, int bottom ) {
+        const uint32_t s = seq.load( std::memory_order_relaxed );
+        seq.store( s + 1, std::memory_order_relaxed );
+        std::atomic_thread_fence( std::memory_order_release );
+        x.store( left, std::memory_order_relaxed );
+        y.store( top, std::memory_order_relaxed );
+        w.store( right - left, std::memory_order_relaxed );
+        h.store( bottom - top, std::memory_order_relaxed );
+        valid.store( true, std::memory_order_relaxed );
+        std::atomic_thread_fence( std::memory_order_release );
+        seq.store( s + 2, std::memory_order_relaxed );
+    }
+
+    uint32_t read_frame( SDL_Rect &out, bool &has_frame ) const {
+        uint32_t s1 = 0;
+        uint32_t s2 = 0;
+        int rx = 0;
+        int ry = 0;
+        int rw = 0;
+        int rh = 0;
+        bool rv = false;
+        do {
+            s1 = seq.load( std::memory_order_acquire );
+            rx = x.load( std::memory_order_relaxed );
+            ry = y.load( std::memory_order_relaxed );
+            rw = w.load( std::memory_order_relaxed );
+            rh = h.load( std::memory_order_relaxed );
+            rv = valid.load( std::memory_order_relaxed );
+            std::atomic_thread_fence( std::memory_order_acquire );
+            s2 = seq.load( std::memory_order_relaxed );
+        } while( s1 != s2 || ( s1 & 1u ) );
+        out.x = rx;
+        out.y = ry;
+        out.w = rw;
+        out.h = rh;
+        has_frame = rv;
+        return s1;
+    }
+
+    uint32_t even_sequence() const {
+        return seq.load( std::memory_order_acquire ) & ~uint32_t( 1 );
+    }
+};
+
+static_assert( std::atomic<int>::is_always_lock_free,
+               "visible-frame inbox needs lock-free int atomics on every shipped ABI" );
+static_assert( std::atomic<bool>::is_always_lock_free,
+               "visible-frame inbox needs lock-free bool atomics on every shipped ABI" );
+static_assert( std::atomic<uint32_t>::is_always_lock_free,
+               "visible-frame inbox needs lock-free uint32 atomics on every shipped ABI" );
+
+static android_visible_frame_inbox visible_frame_inbox;
+
+extern "C" {
 
     JNIEXPORT void JNICALL Java_org_libsdl_app_SDLActivity_onNativeVisibleDisplayFrameChanged(
         JNIEnv *env, jclass jcls, jint left, jint top, jint right, jint bottom )
     {
         ( void )env; // unused
         ( void )jcls; // unused
-        has_visible_display_frame = true;
-        visible_display_frame_dirty = true;
-        visible_display_frame.x = left;
-        visible_display_frame.y = top;
-        visible_display_frame.w = right - left;
-        visible_display_frame.h = bottom - top;
+        visible_frame_inbox.publish( left, top, right, bottom );
     }
 
 } // "C"
@@ -737,6 +796,9 @@ SDL_Rect get_android_render_rect( float DisplayBufferWidth, float DisplayBufferH
     }
 
     // Make sure the destination rectangle fits within the visible area
+    SDL_Rect visible_display_frame;
+    bool has_visible_display_frame = false;
+    visible_frame_inbox.read_frame( visible_display_frame, has_visible_display_frame );
     if( get_option<bool>( "ANDROID_KEYBOARD_SCREEN_SCALE" ) && has_visible_display_frame ) {
         int vdf_right = visible_display_frame.x + visible_display_frame.w;
         int vdf_bottom = visible_display_frame.y + visible_display_frame.h;
@@ -4609,10 +4671,12 @@ static void CheckMessages()
     bool is_repeat = false;
 
 #if defined(__ANDROID__)
-    if( visible_display_frame_dirty ) {
+    static uint32_t last_seen_visible_frame_seq = 0;
+    const uint32_t cur_visible_frame_seq = visible_frame_inbox.even_sequence();
+    if( cur_visible_frame_seq != last_seen_visible_frame_seq ) {
+        last_seen_visible_frame_seq = cur_visible_frame_seq;
         needupdate = true;
         ui_manager::redraw_invalidated();
-        visible_display_frame_dirty = false;
     }
 
     uint32_t ticks = GetTicks();
