@@ -2955,6 +2955,11 @@ void options_manager::add_options_android()
              to_translation( "If true, when the virtual keyboard is visible, scale the screen to prevent overlapping.  Useful for text entry so you can see what you're typing." ),
              true
            );
+
+        add( "ANDROID_RENDER_SAFE_AREA", page_id, to_translation( "Confine display to safe area" ),
+             to_translation( "If true, keep the game within the screen's safe area so it does not draw under the camera cutout or other unsafe edges.  If false, the game fills the entire screen." ),
+             true
+           );
     } );
 
     add_empty_line();
