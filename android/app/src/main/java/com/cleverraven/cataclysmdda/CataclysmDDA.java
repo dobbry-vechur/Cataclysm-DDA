@@ -63,6 +63,10 @@ public class CataclysmDDA extends SDLActivity {
 
     private void applyImmersive() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            // Lay the surface out edge to edge. Hiding the bars does not put the
+            // surface under them; without this, pre-15 Android leaves the splash
+            // background showing as an empty strip where the status bar sat.
+            getWindow().setDecorFitsSystemWindows(false);
             WindowInsetsController controller = getWindow().getInsetsController();
             if (controller != null) {
                 controller.hide(WindowInsets.Type.systemBars());
