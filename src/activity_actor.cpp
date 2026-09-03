@@ -45,6 +45,7 @@
 #include "contents_change_handler.h"
 #include "coordinates.h"
 #include "craft_command.h"
+#include "craft_reservation.h"
 #include "crafting.h"
 #include "crafting_enums.h"
 #include "creature.h"
@@ -78,6 +79,7 @@
 #include "item_group.h"
 #include "item_location.h"
 #include "item_pocket.h"
+#include "item_uid.h"
 #include "item_wakeup.h"
 #include "itype.h"
 #include "iuse.h"
@@ -7888,6 +7890,11 @@ void insert_item_activity_actor::finish( player_activity &act, Character &who )
     }
 
     items.pop_front();
+    if( success ) {
+        // The post-insertion holster: recovering capacity can wield the container and
+        // rebind it.  May be map-backed, which is what reaches a container on the ground.
+        craft_relocated( holster );
+    }
     if( items.empty() || !success || items.front().first == item_location::nowhere ) {
         holster.make_active();
         handler.handle_by( who );
