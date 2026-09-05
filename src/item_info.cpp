@@ -30,8 +30,10 @@
 #include "calendar.h"
 #include "cata_utility.h"
 #include "character.h"
+#include "character_id.h"
 #include "character_martial_arts.h"
 #include "color.h"
+#include "craft_reservation.h"
 #include "damage.h"
 #include "debug.h"
 #include "dialogue.h"
@@ -62,6 +64,7 @@
 #include "math_parser_diag_value.h"
 #include "mod_manager.h"
 #include "mtype.h"
+#include "npc.h"
 #include "options.h"
 #include "output.h"
 #include "pimpl.h"
@@ -3950,6 +3953,30 @@ void item::properties_info( std::vector<iteminfo> &info, const iteminfo_query *p
                                activity_var_may->str() ) );
     }
 
+    if( get_craft_reservations().is_reserved_uid( uid().get_value() ) ) {
+        const craft_reservation_index::record *rec =
+            get_craft_reservations().record_for_item_uid( uid().get_value() );
+        const character_id claimant = rec != nullptr ? rec->crafter : character_id();
+        if( claimant.is_valid() && claimant == get_player_character().getID() ) {
+            info.emplace_back( "DESCRIPTION",
+                               _( "* This item is <info>reserved</info> by a craft of yours left running." ) );
+        } else if( npc *who = claimant.is_valid() ? g->find_npc( claimant ) : nullptr ) {
+            info.emplace_back( "DESCRIPTION",
+                               string_format(
+                                   _( "* This item is <info>reserved</info> by a craft %s left running." ),
+                                   who->get_name() ) );
+        } else {
+            info.emplace_back( "DESCRIPTION",
+                               _( "* This item is <info>reserved</info> by a craft left running." ) );
+        }
+        if( has_flag( flag_USE_UPS ) ) {
+            info.emplace_back( "DESCRIPTION",
+                               _( "* Its <bad>UPS charge is not protected</bad> and may be drained by anything." ) );
+        }
+    } else if( craft_reservation::contains_reserved( *this ) ) {
+        info.emplace_back( "DESCRIPTION",
+                           _( "* This holds an item <info>reserved</info> by a craft, so it cannot be used for crafting." ) );
+    }
 }
 
 // Cache for can_craft in final_info.
